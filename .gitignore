@@ -1,0 +1,28 @@
+# Python
+.venv/
+rssi-venv/
+__pycache__/
+*.pyc
+
+# 实测数据（CSV 日志）留在本机，不进仓库
+*.csv
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# 本机签名设置（证书、描述文件因人而异）
+*.local.xcconfig
+build/
+
+# 电脑端卡死时守护进程抓的现场
+peer_*_stuck*.txt
+
+# Mac 电脑端：swift build 的产物、用 open 启动时的输出
+.build/
+mac_peer_stdout.txt
+
+# 开机自启的日志
+logs/

@@ -1,0 +1,5 @@
+build/
+*.zip
+*.json
+*.bin
+__pycache__/

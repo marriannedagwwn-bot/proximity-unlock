@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>用蓝牙连接电脑，测量手机和电脑之间的信号强度。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>扫电脑上显示的登记二维码，只在登记时用，不拍照、不保存画面。</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>仅在你点「解锁」后，用 Face ID 确认是你在请求解锁已登记的 Mac。</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>App 没在运行时，走到电脑附近也能被系统叫起来连电脑（电脑发的 iBeacon）。不记录、不上传你的位置。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>测量电脑发的 iBeacon 信号。不记录、不上传你的位置。</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+</dict>
+</plist>
