@@ -28,7 +28,14 @@ ENROLL_ACK_UUID = "be282b23-6b55-4b86-86ea-b7f8f3c273e3"
 # 手机请电脑显示登记码（docs/protocol.md「手机请求显示登记码」）：有没有登记都开放，内容 1 字节 0x01
 ENROLL_REQUEST_UUID = "3465d7ce-93d4-4d36-9c16-0619b8ebadbf"
 ENROLL_REQUEST_V1 = b"\x01"
+# 手机让电脑锁屏（docs/protocol.md「手动锁屏、解锁」），和 CHALLENGE / UNLOCK 一起开放
+LOCK_UUID = "10c0be5d-68ca-44bd-87ce-a2e42e9604da"
 CAPABILITY = "win-hmac-v3"
+# 手动解锁：电脑锁着、没在请提示时，挑战里的提示编号是 0。签名消息和按提示解锁一样，
+# 编号 0 的签名不能拿去解别的提示，反过来也一样
+MANUAL_PROMPT_ID = 0
+MANUAL_LIFETIME = 30   # 手动解锁的随机数从发出起多少秒有效（按提示解锁是从提示起 120 秒）
+MANUAL_VERSION = 1     # INFO 里的 manual：支持手动解锁和手机锁屏
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,12 @@ class UnlockGate:
     holds in_flight until finish(); both operations otherwise raise UnlockError.
     A different central cannot consume an existing challenge or its failure
     budget, even if an integration accidentally omits its presence check.
+
+    Prompt 0 is a manual unlock (the computer is locked and not prompting; the
+    phone user tapped unlock in the app). Its nonce is valid for MANUAL_LIFETIME
+    seconds from issue, and its failures are counted separately, at most
+    maximum_failures per lock, cleared only by reset_manual_failures() after the
+    computer is really unlocked.
     """
 
     def __init__(self, key, lifetime=120, maximum_failures=3):
@@ -119,13 +132,14 @@ class UnlockGate:
         self.prompt_id = None
         self._last_prompt_id = None
         self._prompt_started = None
-        self._pending = None
+        self._pending = None   # (central, challenge, issued)
         self._authorizing_prompt_id = None
         self.failures = 0
+        self.manual_failures = 0
         self.in_flight = False
 
     def sync(self, prompt_id, now):
-        """None revokes the prompt. Reusing an id cannot renew its lifetime."""
+        """None revokes the prompt; 0 is a manual unlock. Reusing an id cannot renew its lifetime."""
         if prompt_id is not None and (
             not isinstance(prompt_id, int) or not 0 <= prompt_id <= 0xFFFF
         ):
@@ -134,11 +148,24 @@ class UnlockGate:
             return
         self.prompt_id = prompt_id
         self._pending = None
-        if prompt_id is not None and prompt_id != self._last_prompt_id:
+        if prompt_id is not None and prompt_id != MANUAL_PROMPT_ID and prompt_id != self._last_prompt_id:
             self._prompt_started = now
             self.failures = 0
             self._last_prompt_id = prompt_id
         # An already submitted system operation must complete before another.
+
+    def reset_manual_failures(self):
+        """The computer is really unlocked: the next lock starts a new manual budget.
+        A phone disconnecting and reconnecting must not call this."""
+        self.manual_failures = 0
+
+    @property
+    def manual(self):
+        return self.prompt_id == MANUAL_PROMPT_ID
+
+    def _fresh(self, issued, now):
+        return (_finite(now) and _finite(issued)
+                and now >= issued and now - issued <= MANUAL_LIFETIME)
 
     def _valid_time(self, now):
         return (
@@ -151,36 +178,48 @@ class UnlockGate:
         )
 
     def _available(self):
+        used = self.manual_failures if self.manual else self.failures
         return (
             self.prompt_id is not None
-            and self.prompt_id != 0
             and len(self.key.secret) == 32
             and not self.in_flight
             and isinstance(self.maximum_failures, int)
             and self.maximum_failures > 0
-            and self.failures < self.maximum_failures
+            and used < self.maximum_failures
         )
 
     def challenge(self, central, now, nonce=None):
         if not central or not self._available():
             raise UnlockError(UnlockStatus.UNAVAILABLE)
-        if not self._valid_time(now):
+        if self.manual:
+            if not _finite(now):
+                raise UnlockError(UnlockStatus.INVALID_CHALLENGE)
+        elif not self._valid_time(now):
             self._pending = None
             raise UnlockError(UnlockStatus.INVALID_CHALLENGE)
         if self._pending is not None:
-            owner, challenge = self._pending
-            if owner != central:
-                raise UnlockError(UnlockStatus.UNAVAILABLE)
-            return challenge.data
+            owner, challenge, issued = self._pending
+            if self.manual and not self._fresh(issued, now):
+                self._pending = None  # 手动解锁的随机数过期了，换一个新的
+            else:
+                if owner != central:
+                    raise UnlockError(UnlockStatus.UNAVAILABLE)
+                return challenge.data
         nonce = secrets.token_bytes(16) if nonce is None else bytes(nonce)
         if len(nonce) != 16:
             raise UnlockError(UnlockStatus.INVALID_CHALLENGE)
         challenge = Challenge(self.prompt_id, nonce)
-        self._pending = (central, challenge)
+        self._pending = (central, challenge, now)
         return challenge.data
 
+    def _count_failure(self):
+        if self.manual:
+            self.manual_failures += 1
+        else:
+            self.failures += 1
+
     def _failed(self, status):
-        self.failures += 1
+        self._count_failure()
         raise UnlockError(status)
 
     def authorize(self, data, central, now, eligible):
@@ -195,9 +234,9 @@ class UnlockGate:
             raise UnlockError(UnlockStatus.UNAVAILABLE)
         if self._pending is None:
             self._failed(UnlockStatus.INVALID_CHALLENGE)
-        _, challenge = self._pending
+        _, challenge, issued = self._pending
         self._pending = None  # Every owner attempt consumes the nonce.
-        if not self._valid_time(now):
+        if not (self._fresh(issued, now) if self.manual else self._valid_time(now)):
             self._failed(UnlockStatus.INVALID_CHALLENGE)
         if len(data) != UnlockProtocol.command_length:
             self._failed(UnlockStatus.INVALID_SIGNATURE)
@@ -211,7 +250,7 @@ class UnlockGate:
 
     def finish(self, succeeded=True):
         if self.in_flight and not succeeded and self.prompt_id == self._authorizing_prompt_id:
-            self.failures += 1
+            self._count_failure()
         self.in_flight = False
         self._pending = None
         self._authorizing_prompt_id = None
@@ -220,6 +259,77 @@ class UnlockGate:
         """Disconnect drops only that central's nonce, not another's operation."""
         if self._pending is not None and self._pending[0] == central:
             self._pending = None
+
+
+class LockProtocol:
+    """The phone asks the computer to lock (docs/protocol.md「手动锁屏、解锁」).
+
+    32 bytes: keyID (UInt32 LE) + the latest heartbeat seq the phone received
+    (UInt32 LE) + an 8-byte per-packet nonce + HMAC-SHA256(secret, b"lock-v1" +
+    reportNonce + the first 16 bytes)[:16]. Like an authenticated report, old
+    packets are stopped by "a heartbeat seq this worker really sent, not
+    expired" plus no replay; no challenge is needed.
+    """
+
+    uuid = LOCK_UUID
+    length = 32
+
+    @staticmethod
+    def sequence(data):
+        return struct.unpack_from("<I", data, 4)[0] if len(data) == LockProtocol.length else None
+
+    @staticmethod
+    def tag(key, report_nonce, prefix):
+        return hmac.new(key.secret, b"lock-v1" + bytes(report_nonce) + bytes(prefix), hashlib.sha256).digest()[:16]
+
+    @staticmethod
+    def command(key, report_nonce, seq, packet_nonce):
+        if len(key.secret) != 32 or len(report_nonce) != 16 or len(packet_nonce) != 8:
+            raise ValueError("invalid lock command lengths")
+        prefix = struct.pack("<II", key.id, seq) + bytes(packet_nonce)
+        return prefix + LockProtocol.tag(key, report_nonce, prefix)
+
+
+class LockGate:
+    """Key, signature, heartbeat-seq freshness and no replay for LOCK.
+
+    Locking only makes the computer safer, so there is no challenge and no
+    failure limit. accept() returns None or raises ReportAuthenticationError
+    with the same reasons as an authenticated report.
+    """
+
+    def __init__(self, key, report_nonce, maximum_interval=30):
+        self.key = key
+        self.report_nonce = bytes(report_nonce)
+        self.maximum_interval = maximum_interval
+        self._seen_tags = {}
+
+    def accept(self, data, sent_at, now, current_interval):
+        """sent_at: when this worker really sent that seq to this connection (same clock as now)."""
+        if (
+            len(self.key.secret) != 32 or len(self.report_nonce) != 16 or not _finite(now)
+            or not _finite(self.maximum_interval) or not _finite(current_interval)
+            or not 0 <= current_interval <= self.maximum_interval
+        ):
+            raise ReportAuthenticationError("invalid_configuration")
+        retention = max(10, self.maximum_interval + 5)
+        self._seen_tags = {tag: seen for tag, seen in self._seen_tags.items() if now - seen <= retention}
+        data = bytes(data)
+        if len(data) != LockProtocol.length:
+            raise ReportAuthenticationError("invalid_format")
+        if struct.unpack_from("<I", data)[0] != self.key.id:
+            raise ReportAuthenticationError("wrong_key")
+        if (
+            not _finite(sent_at) or now < sent_at
+            or now - sent_at > max(10, current_interval + 5)
+        ):
+            raise ReportAuthenticationError("stale_heartbeat")
+        supplied = data[16:32]
+        if not hmac.compare_digest(LockProtocol.tag(self.key, self.report_nonce, data[:16]), supplied):
+            raise ReportAuthenticationError("invalid_signature")
+        if supplied in self._seen_tags:
+            raise ReportAuthenticationError("replay")
+        self._seen_tags[supplied] = now
 
 
 class AuthenticatedReportProtocol:

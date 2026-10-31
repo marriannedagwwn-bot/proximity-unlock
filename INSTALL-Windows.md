@@ -55,6 +55,7 @@ Start-ScheduledTask -TaskName IphoneProximityUnlock-WinPeer
 ## 用起来要知道的
 
 - 走开：60 秒没碰键盘鼠标，并且手机失联或信号弱，就锁屏、关屏。回来：手机信号明显变强就请手机解锁，登记过就自动解开。走开不到 1 分钟就回来，不会自动解锁。
+- App 首页每台电脑右边的锁按钮：锁着时点一下解锁，没锁时点一下锁屏，不用 Face ID（要 App 和电脑端都是 0.1.2 以上）。手机让电脑锁屏后，电脑端不主动关屏，锁屏界面约 30 秒后系统自己关，这样之后在手机上点解锁照样有人应答。
 - 默认锁屏后马上关屏（`--screen off`）。支持现代待机的笔记本因此进了待机、或者合了盖以后，电脑端会被冻住，回来要先按一下键或电源键，之后手机连着就会自动解锁。
 - 手机连着时重启电脑端，Windows 的蓝牙广播可能会坏（App 里重新添加时搜不到这台电脑）。按这个顺序重启：`install_autostart.ps1 -Stop`，再 `.venv\Scripts\python prototype\bt_toggle.py --settle 0`（关开一次蓝牙），然后马上 `Start-ScheduledTask -TaskName IphoneProximityUnlock-WinPeer`。
 - 手机每 30 秒断开一次、关开蓝牙也不好时，重启 Windows。

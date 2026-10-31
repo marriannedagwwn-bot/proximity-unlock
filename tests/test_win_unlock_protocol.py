@@ -9,6 +9,9 @@ from prototype.win_unlock_protocol import (
     AuthenticatedReportProtocol,
     Challenge,
     EnrollAckProtocol,
+    LockGate,
+    LockProtocol,
+    MANUAL_PROMPT_ID,
     ReportAuthenticationError,
     UnlockError,
     UnlockGate,
@@ -62,8 +65,9 @@ class UnlockProtocolTests(unittest.TestCase):
                 self.assertFalse(EnrollAckProtocol.verify(data, other, nonce))
         self.assertIsNone(EnrollAckProtocol.key_id(ack[:-1]))
 
-    def test_no_prompt_zero_prompt_or_invalid_key_never_enables(self):
-        for key, prompt in ((self.key, None), (self.key, 0), (UnlockKey(1, b"x"), 1)):
+    def test_no_prompt_or_invalid_key_never_enables(self):
+        # 编号 0 是手动解锁，见 ManualUnlockTests
+        for key, prompt in ((self.key, None), (UnlockKey(1, b"x"), 1), (UnlockKey(1, b"x"), 0)):
             with self.subTest(prompt=prompt, key_length=len(key.secret)):
                 gate = UnlockGate(key)
                 gate.sync(prompt, now=100)
@@ -179,6 +183,135 @@ class UnlockProtocolTests(unittest.TestCase):
         command = self.command(now=102)
         self.gate.clear_central("trusted")
         self.rejected(UnlockStatus.INVALID_CHALLENGE, self.authorize, command, now=102)
+
+
+class ManualUnlockTests(unittest.TestCase):
+    """docs/protocol.md「手动锁屏、解锁」：电脑锁着、没在请提示时，挑战编号 0"""
+
+    def setUp(self):
+        self.key = UnlockKey(0x78563412, bytes(range(32)))
+        self.gate = UnlockGate(self.key)
+        self.gate.sync(MANUAL_PROMPT_ID, now=100)
+
+    def rejected(self, status, function, *args, **kwargs):
+        with self.assertRaises(UnlockError) as rejected:
+            function(*args, **kwargs)
+        self.assertEqual(rejected.exception.status, status)
+
+    def command(self, now=100, nonce=None):
+        data = self.gate.challenge("trusted", now, nonce)
+        return UnlockProtocol.command(self.key, UnlockProtocol.parse_challenge(data))
+
+    def failed_signature(self, now):
+        command = bytearray(self.command(now=now))
+        command[-1] ^= 1
+        self.rejected(UnlockStatus.INVALID_SIGNATURE, self.gate.authorize, bytes(command), "trusted", now, True)
+
+    def test_fixed_vectors_shared_with_mac_and_iphone(self):
+        # docs/protocol.md 的固定向量，Python hmac 独立算的
+        challenge = UnlockProtocol.parse_challenge(bytes(2) + bytes(range(16)))
+        self.assertEqual(UnlockProtocol.command(self.key, challenge).hex(),
+                         "1234567800004a778d2cb1f5141a5d8edd20c871dac0")
+        lock = LockProtocol.command(self.key, bytes(range(16)), 0x11223344, bytes(range(8)))
+        self.assertEqual(lock.hex(), "12345678443322110001020304050607442b75904bb993b827ddb143ec6926a8")
+        self.assertEqual(LockProtocol.sequence(lock), 0x11223344)
+        self.assertIsNone(LockProtocol.sequence(lock[:-1]))
+
+    def test_nonce_lasts_30_seconds_from_issue_then_renews(self):
+        first = self.gate.challenge("trusted", 100, bytes(range(16)))
+        self.assertEqual(first[:2], b"\0\0")
+        self.assertEqual(self.gate.challenge("trusted", 129, bytes(16)), first)  # 同一台手机重读，同一个
+        self.rejected(UnlockStatus.UNAVAILABLE, self.gate.challenge, "stranger", 129)
+        self.assertNotEqual(self.gate.challenge("trusted", 130.01, bytes(16)), first)  # 过期了换新的
+        self.gate.sync(MANUAL_PROMPT_ID, now=1000)  # 锁了很久也照样给（不像提示那样从提示起算）
+        self.assertEqual(len(self.gate.challenge("trusted", 1000)), 18)
+
+    def test_valid_command_and_expired_command(self):
+        self.gate.authorize(self.command(), "trusted", 129, True)
+        self.assertTrue(self.gate.in_flight)
+        self.gate.finish()
+        command = self.command(now=200)
+        self.rejected(UnlockStatus.INVALID_CHALLENGE, self.gate.authorize, command, "trusted", 230.01, True)
+        self.assertEqual((self.gate.manual_failures, self.gate.failures), (1, 0))
+
+    def test_failures_counted_separately_and_cleared_only_by_unlock(self):
+        for n in range(3):
+            self.failed_signature(101 + n)
+        self.assertEqual((self.gate.manual_failures, self.gate.failures), (3, 0))
+        self.rejected(UnlockStatus.UNAVAILABLE, self.gate.challenge, "trusted", 110)
+        self.gate.sync(0x1234, now=111)  # 来了一次提示：提示的次数另算，照样能解
+        self.assertEqual(len(self.gate.challenge("trusted", 112)), 18)
+        self.gate.sync(MANUAL_PROMPT_ID, now=113)  # 提示撤了、还锁着：手动解锁还是用完了
+        self.rejected(UnlockStatus.UNAVAILABLE, self.gate.challenge, "trusted", 114)
+        self.gate.reset_manual_failures()  # 电脑真解锁了
+        self.assertEqual(len(self.gate.challenge("trusted", 115)), 18)
+
+    def test_execution_failure_counts_as_manual_failure(self):
+        self.gate.authorize(self.command(), "trusted", 101, True)
+        self.gate.finish(succeeded=False)
+        self.assertEqual((self.gate.manual_failures, self.gate.failures), (1, 0))
+
+    def test_manual_and_prompt_signatures_are_not_interchangeable(self):
+        nonce = bytes(range(16))
+        self.gate.challenge("trusted", 100, nonce)
+        forged = UnlockProtocol.command(self.key, Challenge(0x1234, nonce))  # 拿提示的编号签同一个随机数
+        self.rejected(UnlockStatus.UNAVAILABLE, self.gate.authorize, forged, "trusted", 101, True)
+        manual = self.command(now=102)
+        self.gate.sync(0x1234, now=103)  # 电脑开始请提示：编号 0 的签名作废
+        self.rejected(UnlockStatus.INVALID_CHALLENGE, self.gate.authorize, manual, "trusted", 103, True)
+
+    def test_manual_does_not_renew_a_prompt_deadline(self):
+        self.gate.sync(0x1234, now=100)
+        self.gate.sync(MANUAL_PROMPT_ID, now=150)
+        self.gate.sync(0x1234, now=200)
+        self.rejected(UnlockStatus.INVALID_CHALLENGE, self.gate.challenge, "trusted", 220.01)
+
+
+class LockGateTests(unittest.TestCase):
+    def setUp(self):
+        self.key = UnlockKey(0x78563412, bytes(range(32)))
+        self.report_nonce = bytes(range(16))
+        self.gate = LockGate(self.key, self.report_nonce, 30)
+        self.counter = 0
+
+    def command(self, seq=7, key=None, report_nonce=None):
+        self.counter += 1
+        return LockProtocol.command(key or self.key, self.report_nonce if report_nonce is None else report_nonce,
+                                    seq, self.counter.to_bytes(8, "little"))
+
+    def rejected(self, reason, data, sent_at=100, now=101, interval=1):
+        with self.assertRaises(ReportAuthenticationError) as rejected:
+            self.gate.accept(data, sent_at, now, interval)
+        self.assertEqual(rejected.exception.reason, reason)
+
+    def test_valid_command_once_then_replay_rejected(self):
+        command = self.command()
+        self.assertIsNone(self.gate.accept(command, 100, 101, 1))
+        self.rejected("replay", command)
+        self.assertIsNone(self.gate.accept(self.command(), 100, 101, 1))  # 同一条心跳、新随机数照样收
+
+    def test_wrong_key_signature_session_and_format(self):
+        other = UnlockKey(0x78563412, bytes(32))
+        self.rejected("invalid_signature", self.command(key=other))
+        self.rejected("wrong_key", self.command(key=UnlockKey(1, bytes(range(32)))))
+        self.rejected("invalid_signature", self.command(report_nonce=bytes(16)))  # 别的进程（旧 INFO）的会话
+        tampered = bytearray(self.command())
+        tampered[-1] ^= 1
+        self.rejected("invalid_signature", bytes(tampered))
+        command = self.command()
+        self.rejected("invalid_format", command[:-1])
+        self.rejected("invalid_format", command + b"\0")
+
+    def test_heartbeat_must_be_really_sent_and_fresh(self):
+        for sent_at, now in ((None, 101), (100, 99), (100, 111.01), (math.nan, 101)):
+            with self.subTest(sent_at=sent_at, now=now):
+                self.rejected("stale_heartbeat", self.command(), sent_at=sent_at, now=now)
+        self.assertIsNone(self.gate.accept(self.command(), 100, 135, 30))  # 休眠档 30 秒一次心跳
+
+    def test_invalid_configuration_fails_closed(self):
+        self.rejected("invalid_configuration", self.command(), interval=31)
+        self.rejected("invalid_configuration", self.command(), now=math.inf)
+        self.rejected("invalid_configuration", self.command(), interval=-1)
 
 
 class AuthenticatedReportTests(unittest.TestCase):

@@ -39,8 +39,9 @@ from datetime import datetime
 from multiprocessing import shared_memory
 
 from win_unlock_protocol import (
-    ENROLL_ACK_UUID, ENROLL_REQUEST_UUID, ENROLL_REQUEST_V1, AuthenticatedReportGate, AuthenticatedReportProtocol,
-    EnrollAckProtocol, ReportAuthenticationError, UnlockError, UnlockGate, UnlockKey, UnlockStatus,
+    ENROLL_ACK_UUID, ENROLL_REQUEST_UUID, ENROLL_REQUEST_V1, LOCK_UUID, MANUAL_PROMPT_ID, MANUAL_VERSION,
+    AuthenticatedReportGate, AuthenticatedReportProtocol, EnrollAckProtocol, LockGate, LockProtocol,
+    ReportAuthenticationError, UnlockError, UnlockGate, UnlockKey, UnlockStatus,
 )
 from windows_unlock.backend import load_backend
 
@@ -886,6 +887,8 @@ class Peer:
         self.authenticated_reports = (AuthenticatedReportGate(key, self.report_nonce, self.maximum_interval)
                                       if key is not None else None)
         self.unlock_gate = UnlockGate(key) if key is not None else None
+        # 手机让电脑锁屏（App 首页的锁按钮，docs/protocol.md「手动锁屏、解锁」），登记了才有
+        self.lock_gate = LockGate(key, self.report_nonce, self.maximum_interval) if key is not None else None
         self.unlock_failed = False  # 系统提交失败后停用到手动解锁，不能由新靠近提示反复提交错误密码
         self.enroll_prompt = None     # 手机请求显示登记码时另起的确认进程（enroll_prompt.py），开着就不再起第二个
         self.enroll_prompt_at = -math.inf
@@ -894,7 +897,8 @@ class Peer:
         self.judge = Judge(self)
         if self.unlock_backend is not None:
             self.log("unlock_enabled", note=UNLOCK_CAPABILITY)
-            self.say("已启用登记手机自动解锁：只接受当前连接的认证报告和一次性签名请求。")
+            self.say("已启用登记手机自动解锁：只接受当前连接的认证报告和一次性签名请求"
+                     "（当前提示，或锁着时手机上手动解锁）；手机也能让电脑锁屏。")
         elif load_failed:
             self.log("unlock_disabled", note="本机登记或 Credential Provider 不可用")
             self.say("本机自动解锁登记或组件不可用，请检查本机安装和登记。")
@@ -903,7 +907,9 @@ class Peer:
         fields = {"proto": PROTO_VERSION, "platform": sys.platform, "name": socket.gethostname()}
         if self.unlock_backend is not None and self.unlock_backend.available():
             fields.update(unlock=UNLOCK_CAPABILITY,
-                          reportNonce=base64.b64encode(self.report_nonce).decode("ascii"))
+                          reportNonce=base64.b64encode(self.report_nonce).decode("ascii"),
+                          # 支持手动解锁（锁着、没在请提示时也给挑战）和手机锁屏（docs/protocol.md「手动锁屏、解锁」）
+                          manual=MANUAL_VERSION)
         return json.dumps(fields, ensure_ascii=False).encode()
 
     def clear_connection_proof(self, dev_id):
@@ -922,15 +928,26 @@ class Peer:
                 and self.authenticated_reports.is_fresh(dev_id, time.monotonic(), self.judge.current_interval))
 
     def sync_unlock_gate(self):
+        """
+        每次访问都重新核对系统锁屏。返回现在能解的目标：正在请的提示编号；锁着、没在请提示时是 0
+        （手动解锁，手机用户在 App 里点了解锁）；不能解是 None。0 也是能解，调用方要用 is None 判断。
+        系统解锁失败一次（unlock_failed）就连手动解锁一起停，直到在电脑上解开：不能反复提交错误密码
+        """
         if self.unlock_gate is None:
-            return False
+            return None
         locked = workstation_locked()
         if not locked:
             self.unlock_failed = False
-        eligible = (self.args.lock and not self.unlock_failed and self.judge.prompting and locked
-                    and self.authenticated_reports.has_fresh_report(time.monotonic(), self.judge.current_interval))
-        self.unlock_gate.sync(self.judge.prompt_id if eligible else None, time.monotonic())
-        return eligible
+            self.unlock_gate.reset_manual_failures()  # 真解锁了才清零，手机断开再连回不清
+        if not (self.args.lock and not self.unlock_failed and locked
+                and self.authenticated_reports.has_fresh_report(time.monotonic(), self.judge.current_interval)):
+            target = None
+        elif self.judge.prompting:
+            target = self.judge.prompt_id
+        else:
+            target = MANUAL_PROMPT_ID
+        self.unlock_gate.sync(target, time.monotonic())
+        return target
 
     def now(self):
         return time.time() - self.t0
@@ -1015,15 +1032,17 @@ class Peer:
         # 有没有登记都开放：第一次登记也要靠它请电脑弹窗
         self.enroll_request_char = await self._char(ENROLL_REQUEST_UUID, Props.WRITE, "enroll_request")
         self.enroll_request_char.add_write_requested(lambda s, a: self.defer(a, self.on_write_enroll_request))
-        self.challenge_char = self.unlock_char = self.enroll_ack_char = None
+        self.challenge_char = self.unlock_char = self.enroll_ack_char = self.lock_char = None
         if self.unlock_gate is not None:
             # 不开放 KEY 特征；手机只能通过本机离线登记得到随机密钥。
             self.challenge_char = await self._char(CHALLENGE_UUID, Props.READ, "challenge")
             self.unlock_char = await self._char(UNLOCK_UUID, Props.WRITE, "unlock")
             self.enroll_ack_char = await self._char(ENROLL_ACK_UUID, Props.WRITE, "enroll_ack")
+            self.lock_char = await self._char(LOCK_UUID, Props.WRITE, "lock")
             self.challenge_char.add_read_requested(lambda s, a: self.defer(a, self.on_read_challenge))
             self.unlock_char.add_write_requested(lambda s, a: self.defer(a, self.on_write_unlock))
             self.enroll_ack_char.add_write_requested(lambda s, a: self.defer(a, self.on_write_enroll_ack))
+            self.lock_char.add_write_requested(lambda s, a: self.defer(a, self.on_write_lock))
 
         # WinRT 事件在系统线程上触发，统一转回蓝牙线程的事件循环处理
         self.hb.add_subscribed_clients_changed(lambda s, a: self.loop.call_soon_threadsafe(self.on_subscribers))
@@ -1173,7 +1192,7 @@ class Peer:
             t.cancel()
         # 放掉对服务的引用，系统马上撤掉这个服务，不用等进程没了以后过几分钟才清理
         self.hb = self.report = self.info_char = self.enroll_request_char = self.provider = self.beacon = None
-        self.challenge_char = self.unlock_char = self.enroll_ack_char = None
+        self.challenge_char = self.unlock_char = self.enroll_ack_char = self.lock_char = None
         if self.unlock_gate is not None:
             self.unlock_gate.sync(None, time.monotonic())
             self.authenticated_reports.clear_all_presence()
@@ -1316,8 +1335,11 @@ class Peer:
             req.respond_with_protocol_error(0x07)
             return
         # 必须先检查本连接，未认证设备不能清掉其它手机的挑战或刷新提示期限。
-        if (generation != self.link_generations.get(dev_id, 0) or not self.request_has_proof(dev_id)
-                or not self.sync_unlock_gate() or not self.unlock_backend.available()):
+        if generation != self.link_generations.get(dev_id, 0) or not self.request_has_proof(dev_id):
+            req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
+            return
+        target = self.sync_unlock_gate()
+        if target is None or not self.unlock_backend.available():
             req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
             return
         try:
@@ -1326,6 +1348,11 @@ class Peer:
             req.respond_with_protocol_error(int(error.status))
         else:
             self.respond_read(req, value)
+            if target == MANUAL_PROMPT_ID and self.judge.saved_brightness is not None:
+                # 手动解锁：和请提示时一样先恢复调暗的亮度，自动解锁没成、要手动输密码时不用对着亮度 0 的锁屏。
+                # 真关屏（默认）不用管：解锁会把电脑从待机里叫醒，屏幕跟着亮
+                self.judge.restore_brightness(self, "手机要手动解锁，先恢复亮度")
+                self.judge.display_off_at = None
 
     async def on_write_unlock(self, args, context=None):
         dev_id, generation = self.request_context(args, context)
@@ -1337,16 +1364,25 @@ class Peer:
         if req.offset != 0:
             req.respond_with_protocol_error(0x07)
             return
-        if (generation != self.link_generations.get(dev_id, 0) or not self.request_has_proof(dev_id)
-                or not self.sync_unlock_gate() or not self.unlock_backend.available()):
+        if generation != self.link_generations.get(dev_id, 0) or not self.request_has_proof(dev_id):
             req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
             return
+        target = self.sync_unlock_gate()
+        if target is None or not self.unlock_backend.available():
+            req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
+            return
+        manual = target == MANUAL_PROMPT_ID
         try:
             self.unlock_gate.authorize(bytes(req.value), dev_id, time.monotonic(), eligible=True)
         except UnlockError as error:
             req.respond_with_protocol_error(int(error.status))
+            if manual:
+                self.log("unlock_fail", device=self.clients.get(dev_id, ""),
+                         note=f"认证拒绝 0x{int(error.status):02x}（手动解锁）")
             return
-        self.log("unlock_request", device=self.clients.get(dev_id, ""), note="当前连接的一次性签名已核对")
+        self.log("unlock_request", device=self.clients.get(dev_id, ""),
+                 note="手动解锁：当前连接的一次性签名已核对（电脑没在请提示，手机用户在 App 里点了解锁）"
+                      if manual else "当前连接的一次性签名已核对")
         ok = False
         try:
             # 原生后端有自己的期限、一次性 IPC 和目标会话校验；等待不占住蓝牙事件循环。
@@ -1358,13 +1394,76 @@ class Peer:
             if not ok:
                 self.unlock_failed = True
         self.log("unlock" if ok else "unlock_fail", device=self.clients.get(dev_id, ""),
-                 note="Windows 已确认目标会话解锁" if ok else "未确认解锁，请手动解锁；不自动重试密码")
+                 note=("Windows 已确认目标会话解锁" if ok else "未确认解锁，请手动解锁；不自动重试密码")
+                      + ("（手动解锁）" if manual else ""))
         if ok:
             req.respond()
             self.judge.update()
             self.sync_unlock_gate()
         else:
             req.respond_with_protocol_error(int(UnlockStatus.EXECUTION_FAILED))
+
+    async def on_write_lock(self, args, context=None):
+        """
+        手机让电脑锁屏（App 首页的锁按钮，docs/protocol.md「手动锁屏、解锁」）：核对登记密钥的签名、心跳 seq 是这次进程
+        对这条连接真发过、没过期的，不重放。本来就锁着也回成功。锁上 2 秒后按 --screen 处理屏幕，和电脑端自己锁屏一样。
+        判断那边当作用户自己锁的屏：手机一直在旁边就不会请提示，要在手机上点一下解锁，或者带着手机走开 1 分钟再回来
+        """
+        dev_id, generation = self.request_context(args, context)
+        self.mark("lock:get_request")
+        req = await args.get_request_async()
+        if req is None:
+            return
+        if req.option != GattWriteOption.WRITE_WITH_RESPONSE:
+            return
+        if req.offset != 0:
+            req.respond_with_protocol_error(0x07)
+            return
+        device = self.clients.get(dev_id, dev_id)
+        if (not self.args.lock or self.lock_gate is None
+                or generation != self.link_generations.get(dev_id, 0) or not self.request_has_proof(dev_id)):
+            req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
+            self.log("phone_lock_reject", device=device, note="这条连接还没有通过认证的报告，或者没开真的锁屏")
+            return
+        data = bytes(req.value)
+        seq = LockProtocol.sequence(data)
+        pending = self.pending_notifications.get(seq) if seq is not None else None
+        if pending is not None:
+            # 和报告一样：手机可能抢在 NotifyValueAsync 的完成回调之前写过来，等实际发送结果
+            try:
+                await asyncio.wait_for(asyncio.shield(pending), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+        if generation != self.link_generations.get(dev_id, 0):
+            req.respond_with_protocol_error(int(UnlockStatus.UNAVAILABLE))
+            self.log("phone_lock_reject", device=device, note="等心跳发送结果时连接断了")
+            return
+        try:
+            self.lock_gate.accept(data, self.authenticated_sent.get((seq, dev_id, generation)),
+                                  time.monotonic(), self.judge.current_interval)
+        except ReportAuthenticationError as error:
+            status = {"invalid_format": 0x0D, "wrong_key": int(UnlockStatus.INVALID_SIGNATURE),
+                      "invalid_signature": int(UnlockStatus.INVALID_SIGNATURE),
+                      "stale_heartbeat": int(UnlockStatus.INVALID_CHALLENGE),
+                      "replay": int(UnlockStatus.INVALID_CHALLENGE)}.get(error.reason, int(UnlockStatus.UNAVAILABLE))
+            req.respond_with_protocol_error(status)
+            self.log("phone_lock_reject", device=device, note=error.reason)
+            return
+        self.mark("lock:lock_check")
+        if workstation_locked():
+            req.respond()
+            self.log("phone_lock", device=device, note="本来就锁着")
+            return
+        self.mark("LockWorkStation")
+        if not lock_workstation():
+            req.respond_with_protocol_error(int(UnlockStatus.EXECUTION_FAILED))
+            self.log("phone_lock_fail", device=device, note="LockWorkStation 失败")
+            return
+        req.respond()
+        self.say(f"⇒ 手机让电脑锁屏：{device}")
+        self.log("phone_lock", device=device, note="已锁屏")
+        # 不主动关屏：电脑端关屏进的待机会把电脑端冻住，之后手机上点解锁没人应答；
+        # 锁屏界面约 30 秒后系统自己关屏，进的是闲置待机，锁着时有电源请求，电脑端照常跑，手机随时能解锁
 
     def enroll_ack_key(self, key_id):
         """验登记确认用的密钥：启动时载入的；重新登记换了新密钥（keyID 不同）时现读本机登记"""

@@ -74,7 +74,7 @@ class PeerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.key = self.protocol.UnlockKey(0x78563412, bytes(range(32)))
         self.packet_counter = 0
         p = self.peer = m.Peer.__new__(m.Peer)
-        p.args = SimpleNamespace(lock=True, interval=1, slow_interval=3, dormant_interval=30)
+        p.args = SimpleNamespace(lock=True, interval=1, slow_interval=3, dormant_interval=30, screen="off")
         p.t0 = time.time() - 100
         p.seq = 0
         p.sent = {}
@@ -88,6 +88,7 @@ class PeerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         p.maximum_interval = 30
         p.authenticated_reports = m.AuthenticatedReportGate(self.key, p.report_nonce, 30)
         p.unlock_gate = m.UnlockGate(self.key)
+        p.lock_gate = m.LockGate(self.key, p.report_nonce, 30)
         p.unlock_failed = False
         p.unlock_backend = Mock(key_id=self.key.id, secret=self.key.secret)
         p.unlock_backend.available.return_value = True
@@ -103,7 +104,8 @@ class PeerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         p.notify_ms = []
         p.judge = SimpleNamespace(current_interval=1, prompting=True, prompt_id=42,
                                   near_since=90, update=Mock(), host_state=lambda: 3,
-                                  heartbeat_interval=lambda: 1)
+                                  heartbeat_interval=lambda: 1, saved_brightness=None,
+                                  display_off_at=None, restore_brightness=Mock())
         p.mark = Mock()
         p.log = Mock()
         p.say = Mock()
@@ -378,6 +380,143 @@ class PeerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.peer.unlock_backend.unlock.assert_called_once_with()
         self.peer.judge.update.assert_called_once_with()
         self.assertFalse(self.peer.unlock_failed)
+
+    # ------------------------------------------------ 手动解锁、手机锁屏（docs/protocol.md「手动锁屏、解锁」）
+
+    def notes(self, event):
+        return [c.kwargs.get("note") for c in self.peer.log.call_args_list if c.args[0] == event]
+
+    async def test_manual_unlock_when_locked_and_not_prompting(self):
+        p = self.peer
+        p.judge.prompting = False
+        await self.establish_proof()
+        req = self.request()
+        await p.on_read_challenge(FakeArgs("trusted", req))
+        challenge = self.protocol.UnlockProtocol.parse_challenge(req.responses[0][1])
+        self.assertEqual(challenge.prompt_id, 0)
+        p.unlock_backend.unlock.return_value = True
+        write = self.request(self.protocol.UnlockProtocol.command(self.key, challenge))
+        await p.on_write_unlock(FakeArgs("trusted", write))
+        self.assertEqual(write.responses, [("success", None)])
+        p.unlock_backend.unlock.assert_called_once_with()
+        self.assertIn("手动解锁", self.notes("unlock_request")[0])
+        self.assertIn("（手动解锁）", self.notes("unlock")[0])
+        p.judge.restore_brightness.assert_not_called()  # 没调暗过就不用恢复
+
+    async def test_manual_unlock_restores_dimmed_screen_and_prompt_signature_cannot_be_used(self):
+        p = self.peer
+        await self.establish_proof()
+        prompt_command = await self.command()        # 请提示（编号 42）时拿到的签名
+        p.judge.prompting = False                    # 提示撤了，还锁着
+        p.judge.saved_brightness = 67
+        manual_req = self.request()
+        await p.on_read_challenge(FakeArgs("trusted", manual_req))
+        self.assertEqual(manual_req.responses[0][1][:2], b"\0\0")
+        p.judge.restore_brightness.assert_called_once()
+        self.assertIn("手动解锁", p.judge.restore_brightness.call_args.args[1])
+        stale = self.request(prompt_command)
+        await p.on_write_unlock(FakeArgs("trusted", stale))
+        self.assertEqual(stale.responses[0][0], "error")
+        p.unlock_backend.unlock.assert_not_called()
+        self.assertEqual(p.unlock_gate.manual_failures, 1)
+        self.assertEqual(self.notes("unlock_fail"), ["认证拒绝 0x80（手动解锁）"])
+
+    async def test_failed_system_unlock_stops_manual_unlock_until_computer_is_unlocked(self):
+        p = self.peer
+        p.judge.prompting = False
+        await self.establish_proof()
+        failed = self.request(await self.command())
+        await p.on_write_unlock(FakeArgs("trusted", failed))
+        self.assertEqual(failed.responses, [("error", int(self.module.UnlockStatus.EXECUTION_FAILED))])
+        self.assertTrue(p.unlock_failed)
+        self.assertEqual(p.unlock_gate.manual_failures, 1)
+        again = self.request()
+        await p.on_read_challenge(FakeArgs("trusted", again))
+        self.assertEqual(again.responses, [("error", int(self.module.UnlockStatus.UNAVAILABLE))])
+        self.locked.return_value = False             # 在电脑上解开了
+        self.assertIsNone(p.sync_unlock_gate())
+        self.assertFalse(p.unlock_failed)
+        self.assertEqual(p.unlock_gate.manual_failures, 0)
+        self.locked.return_value = True
+        self.assertEqual(p.sync_unlock_gate(), 0)
+
+    def test_info_advertises_manual_with_unlock(self):
+        info = json.loads(self.peer.info_payload())
+        self.assertEqual(info["manual"], 1)
+        self.peer.unlock_backend.available.return_value = False
+        self.assertNotIn("manual", json.loads(self.peer.info_payload()))
+
+    def lock_command(self, seq=1, *, key=None, nonce=None):
+        self.packet_counter += 1
+        return self.protocol.LockProtocol.command(key or self.key, self.peer.report_nonce if nonce is None else nonce,
+                                                  seq, self.packet_counter.to_bytes(8, "little"))
+
+    async def write_lock(self, data, device="trusted", **kwargs):
+        req = self.request(data, **kwargs)
+        await self.peer.on_write_lock(FakeArgs(device, req))
+        return req
+
+    async def test_phone_lock_locks_without_turning_the_screen_off(self):
+        # 不主动关屏：电脑端关屏进的待机会把电脑端冻住，之后手机上点解锁没人应答
+        m, p = self.module, self.peer
+        await self.establish_proof()
+        self.locked.return_value = False
+        with patch.object(m, "lock_workstation", return_value=True) as lock, \
+                patch.object(m, "turn_off_display", side_effect=AssertionError("不该关屏")), \
+                patch.object(m, "set_brightness", side_effect=AssertionError("不该调暗")):
+            req = await self.write_lock(self.lock_command())
+        self.assertEqual(req.responses, [("success", None)])
+        lock.assert_called_once_with()
+        self.assertEqual(self.notes("phone_lock"), ["已锁屏"])
+        self.assertIsNone(p.judge.display_off_at)
+        self.locked.return_value = True              # 锁上以后照样能在手机上手动解锁
+        p.judge.prompting = False
+        self.assertEqual(p.sync_unlock_gate(), 0)
+
+    async def test_phone_lock_when_already_locked_or_lock_fails(self):
+        m = self.module
+        await self.establish_proof()
+        with patch.object(m, "lock_workstation", side_effect=AssertionError("本来就锁着")):
+            req = await self.write_lock(self.lock_command())  # setUp 里默认锁着
+        self.assertEqual(req.responses, [("success", None)])
+        self.locked.return_value = False
+        with patch.object(m, "lock_workstation", return_value=False):
+            failed = await self.write_lock(self.lock_command())
+        self.assertEqual(failed.responses, [("error", 0x83)])
+        self.assertEqual(self.notes("phone_lock"), ["本来就锁着"])
+        self.assertEqual(self.notes("phone_lock_fail"), ["LockWorkStation 失败"])
+
+    async def test_phone_lock_rejections_never_lock(self):
+        m, p = self.module, self.peer
+        self.locked.return_value = False
+        unproven = await self.write_lock(self.lock_command(), device="other")
+        self.assertEqual(unproven.responses, [("error", 0x80)])
+        await self.establish_proof()
+        good = self.lock_command()
+        tampered = bytearray(good)
+        tampered[-1] ^= 1
+        cases = [(self.lock_command(seq=9), 0x82),                     # 没发过的心跳
+                 (bytes(tampered), 0x81),
+                 (self.lock_command(key=self.protocol.UnlockKey(7, bytes(range(32)))), 0x81),
+                 (self.lock_command(nonce=bytes(16)), 0x81),           # 旧进程的会话
+                 (good[:-1], 0x0D)]
+        for data, status in cases:
+            with self.subTest(status=hex(status)):
+                req = await self.write_lock(data)
+                self.assertEqual(req.responses, [("error", status)])
+        quiet = await self.write_lock(good, option=m.GattWriteOption.WRITE_WITHOUT_RESPONSE)
+        self.assertEqual(quiet.responses, [])
+        p.args.lock = False
+        off = await self.write_lock(good)
+        self.assertEqual(off.responses, [("error", 0x80)])
+        p.args.lock = True
+        with patch.object(m, "lock_workstation", return_value=True) as lock:
+            first = await self.write_lock(good)
+            replay = await self.write_lock(good)
+        self.assertEqual(first.responses, [("success", None)])
+        self.assertEqual(replay.responses, [("error", 0x82)])
+        lock.assert_called_once_with()
+        self.assertIn("replay", self.notes("phone_lock_reject"))
 
     async def test_unlock_without_response_cannot_reach_backend_or_consume_nonce(self):
         await self.establish_proof()
