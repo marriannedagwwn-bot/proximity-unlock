@@ -62,6 +62,7 @@ struct Args {
       --ref-window 秒     「走远时的信号」看最近多少秒（最近 30 秒不算），取强的那一头（90% 分位），默认 900
       --startup-grace 秒  电脑端启动后多少秒内不算手机失联，默认 30
       --cancel-after 秒   提示解锁以后，手机持续走远多少秒才撤销提示，默认 60；锁屏期间也要走远这么久才会在回来时提示
+      --freeze-away 秒    电脑端被系统睡眠冻住多少秒、醒来时锁着（显示器亮了），就当作手机走远过、回来请提示，默认 60
     心跳快慢和休眠（docs/protocol.md「心跳快慢和休眠」）：
       --slow-th dBm       没人在用电脑、信号中位数低于它时，心跳放慢到 --slow-interval，默认 -75
       --slow-interval 秒  见 --slow-th，默认 3
@@ -113,6 +114,7 @@ struct Args {
             case "--dormant-interval": a.judge.dormantInterval = number(arg)
             case "--startup-grace": a.judge.startupGrace = number(arg)
             case "--cancel-after": a.judge.cancelAfter = number(arg)
+            case "--freeze-away": a.judge.freezeAway = number(arg)
             case "-h", "--help":
                 print(usage)
                 exit(0)
@@ -162,6 +164,8 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
     private let unlockGate: UnlockGate?
     private let reportNonce = UnlockProtocol.randomNonce()
     private let authenticatedReports: AuthenticatedReportGate?
+    /// 手机让电脑锁屏（App 首页的锁按钮），登记了才有
+    private let lockGate: LockGate?
     private var authenticatedSent: [UInt32: Double] = [:]
     private var rejectedReports = 0
     private var lastReportRejectLogAt = -Double.infinity
@@ -171,6 +175,8 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
               var fields = (try? JSONSerialization.jsonObject(with: base)) as? [String: Any] else { return base }
         fields["unlock"] = UnlockProtocol.capability
         fields["reportNonce"] = reportNonce.base64EncodedString()
+        // 支持手动解锁（锁着、没在请提示时也给挑战）和手机锁屏（docs/protocol.md「手动锁屏、解锁」）
+        fields["manual"] = UnlockProtocol.manualVersion
         return (try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])) ?? base
     }()
 
@@ -180,6 +186,7 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
     var infoChar: CBMutableCharacteristic!
     private var challengeChar: CBMutableCharacteristic?
     private var unlockChar: CBMutableCharacteristic?
+    private var lockChar: CBMutableCharacteristic?
     /// 手机请求显示登记码：有没有登记都开放（第一次登记也要用）
     private var enrollRequestChar: CBMutableCharacteristic!
     /// 登记确认：和 CHALLENGE / UNLOCK 一起，登记了才有
@@ -240,10 +247,12 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
         }
         unlockGate = credential.map { UnlockGate(key: $0.key) }
         if let credential {
-            authenticatedReports = AuthenticatedReportGate(key: credential.key, reportNonce: reportNonce,
-                                                           maximumInterval: max(args.judge.interval, args.judge.slowInterval, args.judge.dormantInterval))
+            let longest = max(args.judge.interval, args.judge.slowInterval, args.judge.dormantInterval)
+            authenticatedReports = AuthenticatedReportGate(key: credential.key, reportNonce: reportNonce, maximumInterval: longest)
+            lockGate = LockGate(key: credential.key, reportNonce: reportNonce, maximumInterval: longest)
         } else {
             authenticatedReports = nil
+            lockGate = nil
         }
         judge = Judge(config: args.judge, system: system, started: t0)
         schedule = HeartbeatSchedule(interval: args.judge.interval)
@@ -254,7 +263,7 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
             say("解锁登记无法安全读取，保持只亮屏；请在本机重新登记。")
             log.write("unlock_disabled", note: "登记不可用，保持只亮屏")
         } else if credential != nil {
-            say("已启用登记手机解锁：只接受本机登记密钥签名、当前提示的一次性请求。")
+            say("已启用登记手机解锁：只接受本机登记密钥签名的一次性请求（当前提示，或锁着时手机上手动解锁）；手机也能让电脑锁屏。")
             log.write("unlock_enabled", note: UnlockProtocol.capability)
         }
     }
@@ -304,10 +313,13 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
                                                   properties: [.write], value: nil, permissions: writePerm)
             let ack = CBMutableCharacteristic(type: CBUUID(string: EnrollProtocol.ackUUID),
                                               properties: [.write], value: nil, permissions: writePerm)
+            let lock = CBMutableCharacteristic(type: CBUUID(string: LockProtocol.uuid),
+                                               properties: [.write], value: nil, permissions: writePerm)
             challengeChar = challenge
             unlockChar = command
             enrollAckChar = ack
-            characteristics += [challenge, command, ack]
+            lockChar = lock
+            characteristics += [challenge, command, ack, lock]
         }
         service.characteristics = characteristics
         manager.removeAllServices()
@@ -391,7 +403,7 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
             }
             // 未认证中心不能占住挑战，也不能通过让全局门禁失效来清掉其它手机的挑战。
             guard requestHasFreshAuthenticatedReport(request.central),
-                  syncUnlockGate(recheckEnrollment: true), let unlockGate else {
+                  let target = syncUnlockGate(recheckEnrollment: true), let unlockGate else {
                 respond(m, to: request, status: .unavailable)
                 return
             }
@@ -399,6 +411,12 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
             case .success(let value):
                 request.value = value
                 m.respond(to: request, withResult: .success)
+                if target == UnlockProtocol.manualPromptID && args.judge.wakeOnPrompt {
+                    // 手动解锁：屏幕可能关着（锁屏后关了屏）或在放屏保，先点亮，登录界面的密码框才会出来。
+                    // 按提示解锁时请提示那一刻已经点亮过了
+                    let r = system.displayOn()
+                    log.write("display_on", device: label(request.central), note: r.ok ? "手机要手动解锁" : r.note)
+                }
             case .failure(let status): respond(m, to: request, status: status)
             }
             return
@@ -425,6 +443,10 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
 
     func peripheralManager(_ m: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         if requests.count == 1, let request = requests.first {
+            if let lockChar, request.characteristic.uuid == lockChar.uuid {
+                onLock(request, manager: m)
+                return
+            }
             if request.characteristic.uuid == enrollRequestChar.uuid {
                 onEnrollRequest(request, manager: m)
                 return
@@ -474,8 +496,9 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
     }
 
     /// 每次访问都重新核对系统锁屏，不能只相信一秒前的状态机或手机报来的状态。
+    /// 返回现在能解的目标：正在请的提示编号；锁着、没在请提示时是 0（手动解锁，手机上要 Face ID 确认）；不能解是 nil
     @discardableResult
-    private func syncUnlockGate(recheckEnrollment: Bool = false) -> Bool {
+    private func syncUnlockGate(recheckEnrollment: Bool = false) -> UInt16? {
         var enrolled = credential != nil
         if recheckEnrollment, let credential {
             do {
@@ -486,11 +509,18 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
         }
         let reportIsFresh = authenticatedReports?.hasFreshReport(now: ProcessInfo.processInfo.systemUptime,
                                                                 currentInterval: judge.currentInterval) ?? false
-        let eligible = enrolled && reportIsFresh && args.judge.lock && judge.prompting
-            && judge.hostState == 3 && system.screenLocked()
-        unlockGate?.sync(promptID: eligible ? UInt16(truncatingIfNeeded: judge.promptID) : nil,
-                         now: ProcessInfo.processInfo.systemUptime)
-        return eligible
+        let locked = system.screenLocked()
+        if !locked { unlockGate?.resetManualFailures() }
+        let target: UInt16?
+        if !(enrolled && reportIsFresh && args.judge.lock && locked) {
+            target = nil
+        } else if judge.prompting && judge.hostState == 3 {
+            target = UInt16(truncatingIfNeeded: judge.promptID)
+        } else {
+            target = UnlockProtocol.manualPromptID
+        }
+        unlockGate?.sync(promptID: target, now: ProcessInfo.processInfo.systemUptime)
+        return target
     }
 
     private func respond(_ manager: CBPeripheralManager, to request: CBATTRequest, status: UnlockStatus) {
@@ -595,18 +625,22 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
             respond(manager, to: request, status: .unavailable)
             return
         }
-        let eligible = syncUnlockGate(recheckEnrollment: true)
+        let target = syncUnlockGate(recheckEnrollment: true)
+        let manual = target == UnlockProtocol.manualPromptID
         guard let credential, let unlockGate else {
             respond(manager, to: request, status: .unavailable)
             return
         }
         switch unlockGate.authorize(request.value ?? Data(), from: request.central.identifier,
-                                    now: ProcessInfo.processInfo.systemUptime, eligible: eligible) {
+                                    now: ProcessInfo.processInfo.systemUptime, eligible: target != nil) {
         case .failure(let status):
-            log.write("unlock_fail", device: label(request.central), note: "认证拒绝 0x\(String(status.rawValue, radix: 16))")
+            log.write("unlock_fail", device: label(request.central),
+                      note: "认证拒绝 0x\(String(status.rawValue, radix: 16))" + (manual ? "（手动解锁）" : ""))
             respond(manager, to: request, status: status)
         case .success:
-            log.write("unlock_request", device: label(request.central), note: "当前提示的一次性签名已核对")
+            log.write("unlock_request", device: label(request.central),
+                      note: manual ? "手动解锁：一次性签名已核对（电脑没在请提示，手机用户在 App 里点了解锁）"
+                                   : "当前提示的一次性签名已核对")
             // 等待 AX 操作和真实锁屏状态确认；Task 的等待不会阻塞蓝牙 delegate 或主队列心跳。
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -614,7 +648,7 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
                 let ok = result.ok && !self.system.screenLocked()
                 unlockGate.finish(succeeded: ok)
                 self.log.write(ok ? "unlock" : "unlock_fail", device: self.label(request.central),
-                               note: ok ? "系统已确认解锁" : "系统解锁未成功，需在电脑上手动解锁")
+                               note: (ok ? "系统已确认解锁" : "系统解锁未成功，需在电脑上手动解锁") + (manual ? "（手动解锁）" : ""))
                 if ok {
                     manager.respond(to: request, withResult: .success)
                     self.judgeTick()
@@ -623,6 +657,55 @@ final class Peer: NSObject, CBPeripheralManagerDelegate {
                 }
             }
         }
+    }
+
+    /// 手机让电脑锁屏（App 首页的锁按钮，docs/protocol.md「手动锁屏、解锁」）：核对登记密钥的签名、
+    /// 心跳 seq 是这次进程真发过、没过期的，不重放。本来就锁着也回成功。锁上 2 秒后关显示器，和电脑端自己锁屏一样。
+    /// 判断那边当作用户自己锁的屏：手机一直在旁边就不会请提示，要手机上手动解锁，或者带着手机走开 1 分钟再回来
+    private func onLock(_ request: CBATTRequest, manager m: CBPeripheralManager) {
+        let device = label(request.central)
+        guard request.offset == 0, args.judge.lock, let lockGate, requestHasFreshAuthenticatedReport(request.central) else {
+            respond(m, to: request, status: .unavailable)
+            log.write("phone_lock_reject", device: device, note: "这条连接还没有通过认证的报告，或者没开真的锁屏")
+            return
+        }
+        let data = request.value ?? Data()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let sentAt = LockProtocol.sequence(data).flatMap { authenticatedSent[$0] }
+        if case .failure(let reason) = lockGate.accept(data, sentAt: sentAt, now: uptime, currentInterval: judge.currentInterval) {
+            switch reason {
+            case .invalidFormat: m.respond(to: request, withResult: .invalidAttributeValueLength)
+            case .wrongKey, .invalidSignature: respond(m, to: request, status: .invalidSignature)
+            case .staleHeartbeat, .replay: respond(m, to: request, status: .invalidChallenge)
+            case .invalidConfiguration: respond(m, to: request, status: .unavailable)
+            }
+            log.write("phone_lock_reject", device: device, note: "\(reason)")
+            return
+        }
+        if system.screenLocked() {
+            m.respond(to: request, withResult: .success)
+            log.write("phone_lock", device: device, note: "本来就锁着")
+            return
+        }
+        let r = system.lockScreen()
+        guard r.ok else {
+            respond(m, to: request, status: .executionFailed)
+            log.write("phone_lock_fail", device: device, note: r.note)
+            return
+        }
+        m.respond(to: request, withResult: .success)
+        say("⇒ 手机让电脑锁屏：\(device)")
+        log.write("phone_lock", device: device, note: "已锁屏")
+        if args.judge.displayOff {
+            // 等锁屏界面出来再关，免得被锁屏动画重新点亮
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.system.screenLocked() else { return }
+                let r = self.system.displayOff()
+                self.say(r.ok ? "⇒ 已关屏" : "⇒ 关屏失败")
+                self.log.write("display_off", note: r.ok ? "手机锁屏" : r.note)
+            }
+        }
+        judgeTick()
     }
 
     private func onReport(_ data: Data, from central: CBCentral) -> Bool {

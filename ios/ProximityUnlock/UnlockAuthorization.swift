@@ -3,6 +3,12 @@ import Foundation
 import LocalAuthentication
 import Security
 
+/// 手动解锁（docs/protocol.md「手动锁屏、解锁」）
+enum UnlockProtocol {
+    /// 电脑锁着、没在请提示时，挑战里的提示编号是 0
+    static let manualPromptID: UInt16 = 0
+}
+
 /// 只接受明确实现应用层 v3 的平台/能力组合，不按前缀或协议版本推断能力。
 enum UnlockCapability {
     static func supports(platform: String?, capability: String?) -> Bool {
@@ -29,13 +35,15 @@ struct UnlockEnrollment: Codable, Equatable {
         return value
     }
 
-    func request(challenge: Data, expectedPromptID: UInt16) throws -> Data {
+    /// 编号 0 是手动解锁（电脑锁着、没在请提示，docs/protocol.md「手动锁屏、解锁」），要 manual 明确说要它；
+    /// 按提示解锁时编号 0 一律不签，免得把手动的挑战当成提示
+    func request(challenge: Data, expectedPromptID: UInt16, manual: Bool = false) throws -> Data {
         guard secret.count == 32, challenge.count == 18 else {
             throw UnlockAuthorizationError.invalidChallenge
         }
         let bytes = [UInt8](challenge)
         let promptID = UInt16(bytes[0]) | UInt16(bytes[1]) << 8
-        guard promptID != 0, promptID == expectedPromptID else {
+        guard promptID == expectedPromptID, manual == (promptID == UnlockProtocol.manualPromptID) else {
             throw UnlockAuthorizationError.stalePrompt
         }
         var message = Data("unlock-v2".utf8)
@@ -81,6 +89,26 @@ struct UnlockEnrollment: Codable, Equatable {
         message.append(id)
         let signature = HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: secret))
         return id + Data(signature.prefix(16))
+    }
+
+    /// 让电脑锁屏（LOCK）：32 字节，keyID、最近一次收到的心跳 seq（都是小端）、每包随机数 8 字节、
+    /// HMAC(secret, "lock-v1" ‖ reportNonce ‖ 前 16 字节) 的前 16 字节。电脑核对 seq 是它刚发过的心跳、包没重放过
+    func lockCommand(seq: UInt32, sessionNonce: Data, packetNonce: Data) throws -> Data {
+        guard secret.count == 32, sessionNonce.count == 16, packetNonce.count == 8 else {
+            throw UnlockAuthorizationError.invalidReport
+        }
+        var payload = Data()
+        var id = keyID.littleEndian
+        withUnsafeBytes(of: &id) { payload.append(contentsOf: $0) }
+        var s = seq.littleEndian
+        withUnsafeBytes(of: &s) { payload.append(contentsOf: $0) }
+        payload.append(packetNonce)
+        var message = Data("lock-v1".utf8)
+        message.append(sessionNonce)
+        message.append(payload)
+        let signature = HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: secret))
+        payload.append(contentsOf: signature.prefix(16))
+        return payload
     }
 
     static func randomReportNonce() throws -> Data {

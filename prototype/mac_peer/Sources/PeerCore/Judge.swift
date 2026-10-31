@@ -42,6 +42,8 @@ public struct JudgeConfig {
     public var dormantAfter = 1800.0
     /// 休眠时心跳间隔（--dormant-interval）
     public var dormantInterval = 30.0
+    /// 电脑端被系统睡眠冻住多少秒、醒来时锁着（显示器亮了），就当作手机走远过、回来请提示（--freeze-away）
+    public var freezeAway = 60.0
 
     public init() {}
 }
@@ -79,6 +81,8 @@ public protocol HostSystem: AnyObject {
     func displayOff() -> (ok: Bool, note: String)
     /// 点亮显示器，和动一下鼠标一样。失败时 note 写原因
     func displayOn() -> (ok: Bool, note: String)
+    /// 显示器睡没睡：true 睡着（关了屏、Power Nap 的维护唤醒），false 亮着，nil 不知道。冻住后醒来时用
+    func displayAsleep() -> Bool?
 }
 
 /// 判断要的连接状态，由 Peer 每次提供
@@ -109,6 +113,8 @@ public struct LinkSnapshot {
 ///   （reference）强 approachGain → 请手机提示解锁
 ///   （prompt，心跳里电脑状态 3）。用户自己锁屏、人还坐着时手机一直在附近，不会 armed，所以不提示。
 ///   提示以后手机又持续走远 cancelAfter 秒才撤销（prompt_cancel）
+/// - 电脑端被系统睡眠冻住超过 freezeAway 秒、醒来时锁着、显示器亮了：冻住期间看不到手机走没走，
+///   当作手机走远过（armed），手机在旁边就请提示（freeze_away）
 /// - 解锁（不锁屏模式是又有了键盘鼠标操作）→ 记 back，写提示后多久解锁
 /// - 心跳分三档（heartbeatInterval，见 docs/protocol.md「心跳快慢和休眠」）：每秒一次、慢（3 秒）、休眠（30 秒）
 public final class Judge {
@@ -161,7 +167,7 @@ public final class Judge {
     public var currentInterval: Double
     /// 判定离开后确实看到锁上了（锁屏是异步生效的）
     private var seenLocked = false
-    /// 自己锁屏后，到这个时间关显示器
+    /// 判定离开后，到这个时间关显示器（自己锁的等 2 秒，本来就锁着的马上关）
     private var displayOffAt: Double?
     /// 请提示时点亮了屏幕，撤销提示时要关回去
     private var displayWoken = false
@@ -175,6 +181,10 @@ public final class Judge {
     /// 手机走后已经锁过一次、手机还没回来就被解开了（多半是远程解的）：手机回来以前不再自动锁。
     /// 远程操作 Mac 时，操作停一下不应该就锁，不然每次都得远程输密码
     public private(set) var holdLock = false
+    /// 上次判断的时间：隔了很久说明电脑端被系统睡眠冻住了
+    private var lastUpdate: Double?
+    /// 冻住后醒来时锁着、等显示器亮了再当作手机走远过：冻住是从什么时候开始的
+    private var frozenSince: Double?
 
     public init(config: JudgeConfig, system: HostSystem, started: Double, promptID: Int? = nil) {
         self.config = config
@@ -230,6 +240,8 @@ public final class Judge {
     /// 每秒调用一次
     public func update(link: LinkSnapshot, now: Double) {
         let a = config
+        let gap = lastUpdate.map { now - $0 } ?? 0
+        lastUpdate = now
         let idle = system.idleSeconds()
         let med = Self.median(link.recent, now: now, window: medianWindow)
         appProto = link.appProto
@@ -268,6 +280,32 @@ public final class Judge {
         }
         if locked && awayAt != nil { seenLocked = true }
 
+        // 电脑端被冻住过（系统睡眠：MacBook 合盖、手动睡眠），醒来时锁着：冻住期间看不到手机走没走，
+        // 当作手机走远过（armed），手机在旁边就请提示。和 win_peer.py 一样：走开时合了盖，冻住前还没判定离开，
+        // 醒来时手机马上就连回来了，可电脑端没看到手机走过，就会一直不提示，只能手动解锁。
+        // 要等显示器亮了（开盖、按键）才算：Power Nap 的维护唤醒显示器不亮、盖子可能合着，这时不能解
+        if gap >= a.freezeAway && a.lock && locked && !(armed || prompting) {
+            if frozenSince == nil && system.displayAsleep() == true {
+                log("freeze_wait", "", "电脑端 \(fmt0(gap))s 没转（睡眠冻住了），醒来锁着、显示器没亮，等亮了再当作离开过")
+            }
+            frozenSince = frozenSince ?? now - gap
+        }
+        if let since = frozenSince {
+            if !locked || armed || prompting {
+                frozenSince = nil
+            } else if system.displayAsleep() != true {
+                let clock = DateFormatter()
+                clock.dateFormat = "HH:mm:ss"
+                let note = "电脑端从 \(clock.string(from: Date(timeIntervalSince1970: since))) 起被睡眠冻住，"
+                    + "醒来锁着、显示器亮了，当作手机走远过，手机在旁边就请提示"
+                say(note)
+                log("freeze_away", "", note)
+                armed = true
+                refStart = since  // 「走远时的信号」只看冻住以后的报告，冻住前人还坐着
+                frozenSince = nil
+            }
+        }
+
         // 判定离开 → 锁屏；手机走后已经锁过一次、被解开了就不再锁（holdLock）
         if state == .away && awayAt == nil && holdLock {
             if enteringAway {
@@ -276,9 +314,10 @@ public final class Judge {
                 log("lock_skip", "", why + "；手机走后已经锁过一次、被解开了，手机回来以前不再自动锁")
             }
         } else if state == .away && awayAt == nil {
+            // 判定离开只要手机失联或信号弱 10 秒，还不算「走远过」（armed）：要像下面那样持续走远 cancelAfter 秒。
+            // 原来这里直接 armed，判定离开后头二十来秒「走远时的信号」还没有报告（reference 为 nil），「强 10 dB」被跳过，
+            // 信号回到 -72 就请提示：信号只是跌了一下、手机还在屋里，电脑就会自动解锁，可没人在用
             awayAt = now
-            armed = true
-            refStart = refStart ?? goneStart(now)
             let why = "空闲 \(idle.map(fmt0) ?? "?")s，" + (lost ? "手机失联" : "信号 \(med.map(fmt0) ?? "?")")
             if !a.lock {
                 say("⇒ 本来会锁屏")
@@ -286,6 +325,9 @@ public final class Judge {
             } else if locked {
                 say("判定离开（Mac 本来就锁着）")
                 log("lock", "", why + "，本来就锁着")
+                if a.displayOff {
+                    displayOffAt = now  // 锁屏界面早就出来了，马上关
+                }
             } else {
                 let r = system.lockScreen()
                 say(r.ok ? "⇒ 已锁屏：你离开了" : "⇒ 锁屏失败")
@@ -296,7 +338,8 @@ public final class Judge {
             }
         }
 
-        // 锁屏不会关屏，屏幕要亮到系统设定的关屏时间。用户自己锁的不动，按系统自己的设置
+        // 锁屏不会关屏，屏幕要亮到系统设定的关屏时间。判定离开以后关掉，不管是谁锁的：用户自己锁的、屏保锁的
+        // 原来不动，按系统自己的设置，屏保锁的会一直放着屏保（和 Windows 一样）
         if let at = displayOffAt, now >= at {
             displayOffAt = nil
             if locked {

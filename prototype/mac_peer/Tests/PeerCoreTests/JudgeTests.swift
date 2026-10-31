@@ -27,6 +27,9 @@ final class FakeSystem: HostSystem {
         displayOns.append(now)
         return (true, "")
     }
+    /// 显示器睡没睡（displayAsleep 返回它）：维护唤醒时显示器不亮，测试里手动设
+    var asleep: Bool? = false
+    func displayAsleep() -> Bool? { asleep }
 }
 
 /// 一秒一步地模拟：手机每秒报一次信号（nil 表示失联），记下判断记的日志
@@ -95,6 +98,11 @@ final class Sim {
         }
     }
 
+    /// 系统睡眠，电脑端被冻住 seconds 秒：这期间不判断，手机也连不上
+    func freeze(_ seconds: Int) {
+        sys.now += Double(seconds)
+    }
+
     /// 手机主动报一次（亮屏时 App 读一次 RSSI 写的 REPORT），不等心跳
     func wakeReport(_ rssi: Int) {
         recent.append((sys.now, rssi))
@@ -129,7 +137,7 @@ final class JudgeTests: XCTestCase {
         let s = Sim()
         s.run(40, rssi: -60, active: true)
         s.run(30, rssi: -60)          // 没在操作
-        s.run(60, rssi: -85)          // 走远
+        s.run(90, rssi: -85)          // 走远（信号弱满 60 秒才算走远过）
         XCTAssertEqual(s.sys.lockCalls, 1)
         XCTAssertEqual(s.judge.hostState, 2)
         let lock = s.first("lock")!
@@ -245,7 +253,7 @@ final class JudgeTests: XCTestCase {
         XCTAssertNil(s.first("display_off"))
     }
 
-    /// --keep-display、--no-lock、用户自己锁屏：都不关屏
+    /// --keep-display（自己锁的、本来就锁着的都算）、--no-lock：不关屏
     func testNoDisplayOffOtherwise() {
         let keep = Sim(displayOff: false)
         keep.run(40, rssi: -60, active: true)
@@ -253,17 +261,36 @@ final class JudgeTests: XCTestCase {
         XCTAssertEqual(keep.sys.lockCalls, 1)
         XCTAssertEqual(keep.sys.displayOffs, [])
 
+        let keepManual = Sim(displayOff: false)
+        keepManual.run(40, rssi: -60, active: true)
+        keepManual.sys.locked = true
+        keepManual.run(80, rssi: -85)
+        XCTAssertTrue(keepManual.first("lock")!.note.contains("本来就锁着"))
+        XCTAssertEqual(keepManual.sys.displayOffs, [])
+
         let noLock = Sim(lock: false)
         noLock.run(40, rssi: -60, active: true)
         noLock.run(80, rssi: -85)
         XCTAssertEqual(noLock.sys.displayOffs, [])
+    }
 
-        let manual = Sim()
-        manual.run(40, rssi: -60, active: true)
-        manual.sys.locked = true   // 用户自己锁的，之后才判定离开（"本来就锁着"）
-        manual.run(80, rssi: -85)
-        XCTAssertTrue(manual.first("lock")!.note.contains("本来就锁着"))
-        XCTAssertEqual(manual.sys.displayOffs, [])
+    /// 用户自己锁的（或屏保锁的），之后才判定离开（"本来就锁着"）：不再锁，马上关屏，只关一次；回来照样提示、点亮。
+    /// 原来不关屏，屏保锁的会一直放着屏保；和 Windows 一致
+    func testDisplayOffWhenAlreadyLocked() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.sys.locked = true
+        s.run(80, rssi: -85)
+        let lock = s.first("lock")!
+        XCTAssertTrue(lock.note.contains("本来就锁着"), lock.note)
+        XCTAssertEqual(s.sys.lockCalls, 0)
+        XCTAssertEqual(s.sys.displayOffs.map { $0 - s.t0 }, [lock.t])
+        XCTAssertEqual(s.first("display_off")!.t, lock.t)
+
+        s.run(8, rssi: -60)
+        let prompt = s.first("prompt")!
+        XCTAssertEqual(s.sys.displayOns.map { $0 - s.t0 }, [prompt.t])
+        XCTAssertEqual(s.sys.displayOffs.count, 1)
     }
 
     /// 请提示时点亮屏幕；提示后又走远（撤销）就关回去；再回来再点亮
@@ -460,12 +487,12 @@ final class JudgeTests: XCTestCase {
         XCTAssertTrue(prompt.note.contains("比走远时（-71）强 16 dB"), prompt.note)
     }
 
-    /// 走开一会儿（信号 -85）就回来：走远时的信号只看走开以后的，人坐在电脑前时的信号不算
+    /// 走开一会儿（信号 -85，1 分多钟）就回来：走远时的信号只看走开以后的，人坐在电脑前时的信号不算
     func testShortTripStillPrompts() {
         let s = Sim()
         s.run(40, rssi: -55, active: true)
         s.run(30, rssi: -55)          // 人还坐着（信号很强），只是没碰电脑
-        s.run(40, rssi: -85)          // 走开，判定离开、锁屏
+        s.run(70, rssi: -85)          // 走开，判定离开、锁屏，信号弱满 60 秒算走远过
         XCTAssertNotNil(s.first("lock"))
         s.run(40, rssi: -68)          // 回来时揣在兜里，比坐着时弱，但比走开时强 17 dB
         let prompt = s.first("prompt")!
@@ -481,6 +508,43 @@ final class JudgeTests: XCTestCase {
         s.run(8, rssi: -66)
         let prompt = s.first("prompt")!
         XCTAssertTrue(prompt.note.contains("手机刚连回来"), prompt.note)
+    }
+
+    /// 屏保早就锁了、手机在别的房间（-75），信号跌到 -86 十几秒又回到 -70：判定离开（本来就锁着），但还不算走远过，不提示。
+    /// 原来判定离开那一刻就算走远过，这时「走远时的信号」还没有报告，「强 10 dB」被跳过，
+    /// 回到 -72 就请提示、自动解锁了，之后没人用电脑
+    func testBriefDipWhileLockedDoesNotPrompt() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.sys.locked = true           // 屏保锁的
+        s.run(600, rssi: -75)
+        s.run(15, rssi: -86)          // 跌一下
+        XCTAssertTrue(s.first("lock")?.note.contains("本来就锁着") == true, s.first("lock")?.note ?? "没判定离开")
+        s.run(30, rssi: -70)
+        XCTAssertEqual(s.names(Sim.main), ["lock"], "只跌了十几秒，不算走远过")
+        XCTAssertEqual(s.judge.hostState, 2)
+
+        s.run(90, rssi: -88)          // 这次真走远了
+        s.run(8, rssi: -60)
+        let prompt = s.first("prompt")
+        XCTAssertNotNil(prompt, "走远满 60 秒再回来照常提示")
+        XCTAssertTrue(prompt?.note.contains("比走远时（-88）") == true, prompt?.note ?? "")
+    }
+
+    /// 手机在屋里（-72），连接超时断了十几秒又连回：判定离开（手机失联），但没走远满 60 秒，连回来不提示
+    func testBriefDisconnectWhileLockedDoesNotPrompt() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.sys.locked = true
+        s.run(600, rssi: -72)
+        s.run(15, rssi: nil)          // 连接超时
+        XCTAssertTrue(s.first("lock")?.note.contains("手机失联") == true, s.first("lock")?.note ?? "没判定离开")
+        s.run(30, rssi: -72)
+        XCTAssertEqual(s.names(Sim.main), ["lock"], "失联十几秒，不算走远过")
+
+        s.run(70, rssi: nil)          // 这次断了 1 分多钟（出门）
+        s.run(8, rssi: -66)
+        XCTAssertNotNil(s.first("prompt"), "失联满 60 秒再连回照常提示")
     }
 
     /// 心跳三档：有人用电脑每秒；没人用、信号 < -75 每 3 秒；锁着 30 分钟没碰电脑就休眠，不看信号
@@ -642,6 +706,111 @@ final class JudgeTests: XCTestCase {
             s.run(10, rssi: -71)
             XCTAssertEqual(s.names(Sim.main).contains("prompt"), !withReports, withReports ? "读回了报告" : "没读回报告")
         }
+    }
+
+    // MARK: 系统睡眠冻住（和 win_peer.py 一样：合盖走开，原来回来不提示）
+
+    /// freeze_away 的 note 里写的冻住时间
+    private func clock(_ wall: Double) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: Date(timeIntervalSince1970: wall))
+    }
+
+    /// 刚开始走远就睡了（还没判定离开），醒来锁着、手机马上连回：当作走远过，请提示，解锁记「提示后」
+    func testFrozenWhileWalkingAwayPromptsWhenWokenLocked() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.run(20, rssi: -75)                  // 刚开始走远，离判定离开还差几十秒
+        let frozenAt = s.sys.now
+        s.sys.locked = true                   // 合盖、手动睡眠时锁上
+        s.freeze(2341)
+        s.run(1, rssi: nil)                   // 醒来，显示器亮了，手机还没连回
+        XCTAssertEqual(s.sys.lockCalls, 0)
+        XCTAssertNil(s.first("lock"), "本来就锁着，也没判定离开")
+        let freeze = s.first("freeze_away")!
+        XCTAssertTrue(freeze.note.contains("从 \(clock(frozenAt)) 起被睡眠冻住"), freeze.note)
+        s.run(4, rssi: -60)                   // 手机连回：之前一段没有报告，只看 -72，连续 3 秒
+        let prompt = s.first("prompt")!
+        XCTAssertTrue(prompt.note.contains("之前一段没有报告"), prompt.note)
+        XCTAssertEqual(s.judge.hostState, 3)
+        s.sys.locked = false                  // 自动解锁
+        s.run(1, rssi: -60)
+        XCTAssertEqual(s.names(Sim.main), ["prompt", "back"])
+        XCTAssertTrue(s.first("back")!.note.contains("提示后"), s.first("back")!.note)
+    }
+
+    /// Power Nap 的维护唤醒显示器不亮（盖子可能合着）：手机在旁边也不提示，只记一次 freeze_wait；
+    /// 按键、开盖让显示器亮了才算，冻住时间从第一次睡着算起
+    func testDarkWakeWaitsForDisplay() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        let frozenAt = s.sys.now
+        s.sys.locked = true
+        s.sys.asleep = true
+        s.freeze(3600)
+        s.run(1, rssi: nil)                   // 维护唤醒
+        XCTAssertTrue(s.first("freeze_wait")!.note.contains("显示器没亮"), s.first("freeze_wait")!.note)
+        s.run(5, rssi: -55)                   // 手机连上了也不提示
+        s.freeze(1200)                        // 又睡了、又是维护唤醒：不再记
+        s.run(1, rssi: nil)
+        XCTAssertNil(s.first("prompt"))
+        XCTAssertNil(s.first("freeze_away"))
+        XCTAssertEqual(s.names(["freeze_wait"]).count, 1)
+        s.sys.asleep = false                  // 按了键
+        s.run(4, rssi: -55)
+        XCTAssertTrue(s.first("freeze_away")!.note.contains(clock(frozenAt)), s.first("freeze_away")!.note)
+        XCTAssertNotNil(s.first("prompt"))
+    }
+
+    /// 隔得不够久、醒来没锁（不用密码唤醒）、不锁屏模式：都不当作冻住过
+    func testShortGapOrUnlockedWakeDoesNotArm() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.sys.locked = true
+        s.freeze(30)                          // 没到 --freeze-away
+        s.run(5, rssi: -60)
+        s.sys.locked = false
+        s.freeze(2341)
+        s.run(5, rssi: -60)
+        XCTAssertEqual(s.names(["freeze_away", "freeze_wait", "prompt"]), [])
+
+        let noLock = Sim(lock: false)
+        noLock.run(40, rssi: -60, active: true)
+        noLock.sys.locked = true
+        noLock.freeze(2341)
+        noLock.run(5, rssi: -60)
+        XCTAssertEqual(noLock.names(["freeze_away", "freeze_wait", "would_prompt"]), [])
+    }
+
+    /// 等显示器亮的时候手动解开了：作罢，之后再锁（人还坐着）不当作冻住过
+    func testManualUnlockWhileWaitingForDisplayClearsFreeze() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.sys.locked = true
+        s.sys.asleep = true
+        s.freeze(2341)
+        s.run(1, rssi: nil)
+        XCTAssertNotNil(s.first("freeze_wait"))
+        s.sys.locked = false                  // 手动解开了
+        s.run(1, rssi: -60, active: true)
+        s.sys.asleep = false
+        s.sys.locked = true
+        s.run(10, rssi: -60)
+        XCTAssertEqual(s.names(["freeze_away", "prompt"]), [])
+    }
+
+    /// 睡着之前已经判定离开、锁了屏（armed）：醒来不再当作走远过，手机回来照样提示
+    func testFrozenAfterAwayPromptsAsUsual() {
+        let s = Sim()
+        s.run(40, rssi: -60, active: true)
+        s.run(80, rssi: nil)                  // 带着手机走了，判定离开、锁屏
+        XCTAssertEqual(s.sys.lockCalls, 1)
+        s.freeze(2341)
+        s.run(1, rssi: nil)
+        s.run(4, rssi: -60)
+        XCTAssertNil(s.first("freeze_away"))
+        XCTAssertEqual(s.names(Sim.main), ["lock", "prompt"])
     }
 
     func testReference() {

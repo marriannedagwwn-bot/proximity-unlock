@@ -6,7 +6,7 @@ extension Color {
     static let appAccent = Color.indigo
 }
 
-/// 首页的一台电脑：图标、名字、连接状态、锁屏状态、信号
+/// 首页的一台电脑：图标、名字、连接状态和信号、自动解锁，右边是锁按钮（显示锁没锁，点了解锁或锁屏）
 struct ComputerRow: View {
     let computer: ComputerLink
 
@@ -17,20 +17,29 @@ struct ComputerRow: View {
                 Text(computer.name ?? "未知")
                     .font(.headline)
                     .lineLimit(1)
-                ComputerStatus(computer: computer, compact: true)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                if lockState != nil || autoUnlock {
-                    HStack(spacing: 6) {
-                        if let lockState {
-                            LockPill(computer: computer, state: lockState)
-                        }
-                        if autoUnlock {
-                            Pill("自动解锁", symbol: "bolt.fill", color: .green)
-                        }
+                HStack(spacing: 10) {
+                    ComputerStatus(computer: computer, compact: true)
+                        .lineLimit(1)
+                    if let rssi {
+                        SignalReading(rssi: rssi)
+                            .fixedSize()
                     }
                 }
-                if let problem = computer.linkProblem {
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                if autoUnlock {
+                    Pill("自动解锁", symbol: "bolt.fill", color: .green)
+                }
+                if let feedback = computer.actionFeedback {
+                    // 不用 Label：List 里的 Label 会给图标留一栏，图标和字隔得很开，分隔线也跟着它缩进
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Image(systemName: feedback.failed ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                        Text(feedback.text)
+                            .lineLimit(2)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(feedback.failed ? .orange : .green)
+                } else if let problem = computer.linkProblem {
                     Text(problem)
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -38,13 +47,9 @@ struct ComputerRow: View {
                 }
             }
             Spacer(minLength: 8)
-            SignalReading(rssi: rssi)
+            LockButton(computer: computer)
         }
         .padding(.vertical, 6)
-    }
-
-    private var lockState: UInt8? {
-        computer.computerState.flatMap { $0 == ComputerState.unknown ? nil : $0 }
     }
 
     private var autoUnlock: Bool {
@@ -247,7 +252,15 @@ struct ComputerDetailView: View {
                     } label: {
                         Label("现在解锁这台电脑", systemImage: "lock.open.fill")
                     }
-                    .disabled(!computer.canRequestUnlock)
+                    .disabled(!computer.canManualUnlock)
+                    if computer.supportsManual {
+                        Button {
+                            computer.requestLock()
+                        } label: {
+                            Label("锁定这台电脑", systemImage: "lock.fill")
+                        }
+                        .disabled(!computer.canRemoteLock)
+                    }
                 }
             } else {
                 if !computer.supportsUnlock {
@@ -268,10 +281,10 @@ struct ComputerDetailView: View {
                 .disabled(computer.unlockBusy)
                 pasteRow
             }
-            if computer.unlockBusy {
-                ProgressView("正在处理这次解锁…")
+            if computer.unlockBusy || computer.lockBusy {
+                ProgressView(computer.lockBusy ? "正在锁定…" : "正在处理这次解锁…")
             }
-            if let message = enrollmentError ?? computer.unlockStatus {
+            if let message = enrollmentError ?? computer.actionFeedback?.text ?? computer.unlockStatus {
                 Text(message)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -280,7 +293,10 @@ struct ComputerDetailView: View {
             Text("靠近自动解锁")
         } footer: {
             Text(computer.hasUnlockEnrollment
-                 ? "手机靠近、电脑请提示解锁时，自动发一次签名请求，每次提示只试一次；请求发出后连接断了，重新连上时补发一次。关掉自动解锁后，可以用上面的按钮手动解锁。"
+                 ? "手机靠近、电脑请提示解锁时，自动发一次签名请求，每次提示只试一次；请求发出后连接断了，重新连上时补发一次。"
+                    + (computer.supportsManual
+                       ? "电脑锁着时随时可以用上面的按钮（或首页的锁按钮）手动解锁，没锁时可以锁屏，不用 Face ID。"
+                       : "关掉自动解锁后，电脑请提示时可以用上面的按钮手动解锁；这台电脑的电脑端还不支持没提示时手动解锁和锁屏。")
                  : "点「扫码登记」会请电脑弹出登记窗口：在电脑上点一下确认，它才显示二维码，再用手机扫（第一次登记要在电脑上输一次登录密码）。也可以粘贴登记码。登记码只存在这部手机的钥匙串里，登记后默认靠近自动解锁。")
         }
     }
@@ -488,24 +504,108 @@ struct PlatformIcon: View {
     }
 }
 
-/// 信号格加 dBm：-95 dBm 算 0 格，-50 dBm 以上满格
+/// 小号信号格加数字（dBm），跟在状态后面：-95 dBm 算 0 格，-50 dBm 以上满格
 struct SignalReading: View {
     let rssi: Int?
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 3) {
+        HStack(spacing: 3) {
             Image(systemName: "cellularbars", variableValue: level)
-                .font(.title3)
                 .foregroundStyle(rssi == nil ? Color.secondary : Color.appAccent)
-            Text(rssi.map { "\($0) dBm" } ?? "—")
-                .font(.caption.monospacedDigit())
+            Text(rssi.map(String.init) ?? "—")
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
         }
+        .font(.caption)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(rssi.map { "信号 \($0) dBm" } ?? "没有信号")
     }
 
     private var level: Double {
         guard let rssi else { return 0 }
         return min(1, max(0, Double(rssi + 95) / 45))
+    }
+}
+
+/// 首页右边的锁按钮：图标是电脑现在锁没锁，下面一行小字写状态。
+/// 锁着（包括在请提示）点了解锁：发一次签名请求，不要 Face ID；没锁点了锁屏。做不了的时候变灰、点不了
+struct LockButton: View {
+    let computer: ComputerLink
+
+    var body: some View {
+        let look = self.look
+        Button(action: tap) {
+            VStack(spacing: 4) {
+                ZStack {
+                    Circle()
+                        .fill(look.filled ? look.color : look.color.opacity(0.14))
+                    if busy {
+                        ProgressView()
+                            .tint(look.filled ? .white : look.color)
+                    } else {
+                        Image(systemName: look.symbol)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(look.filled ? Color.white : look.color)
+                            .contentTransition(.symbolEffect(.replace))
+                    }
+                }
+                .frame(width: 44, height: 44)
+                Text(look.caption)
+                    .font(.caption2)
+                    .foregroundStyle(look.captionColor)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .disabled(action == nil || busy)
+        .sensoryFeedback(trigger: computer.actionFeedback) { _, new in
+            new.map { $0.failed ? .error : .success }
+        }
+        .accessibilityLabel(look.caption)
+        .accessibilityHint(action == .unlock ? "点按解锁这台电脑" : action == .lock ? "点按锁定这台电脑" : "")
+    }
+
+    private enum Action { case unlock, lock }
+
+    private var busy: Bool { computer.unlockBusy || computer.lockBusy }
+
+    private var state: UInt8? {
+        computer.phase == .connected ? computer.computerState : nil
+    }
+
+    private var action: Action? {
+        switch state {
+        case ComputerState.locked, ComputerState.promptUnlock:
+            computer.canManualUnlock ? .unlock : nil
+        case ComputerState.unlocked:
+            computer.canRemoteLock ? .lock : nil
+        default:
+            nil
+        }
+    }
+
+    private func tap() {
+        switch action {
+        case .unlock: computer.requestUnlock()
+        case .lock: computer.requestLock()
+        case nil: break
+        }
+    }
+
+    private var look: (symbol: String, color: Color, filled: Bool, caption: String, captionColor: Color) {
+        let enabled = action != nil
+        switch state {
+        case ComputerState.promptUnlock:
+            return ("lock.fill", .orange, enabled, "等你解锁", .orange)
+        case ComputerState.locked:
+            return ("lock.fill", enabled ? .appAccent : .secondary, enabled, "已锁屏", .secondary)
+        case ComputerState.unlocked:
+            return ("lock.open.fill", enabled ? .green : .secondary, false, "未锁屏", .secondary)
+        default:
+            return ("lock", .secondary, false, computer.phase == .connected ? "状态未知" : "未连接", .secondary)
+        }
     }
 }
 

@@ -19,7 +19,7 @@
 2. 打开 App，首页「添加电脑」里会出现正在广播的电脑，点它。App 会记住这台电脑，以后自动重连。
    - 列表里的名字是连上读 INFO 读来的（广播包放不下名字），读到之前先显示广播里的名字或「未命名」。电脑要求配对时会弹配对请求。
 3. 要同时用几台电脑（比如 Windows 和 Mac）：点右上角的「+」，再选一台。每台各自连接、各自报信号、各自弹通知，不用再忘记这台、改选那台。
-   - 首页「我的电脑」每台一张卡片：连接状态、锁屏状态（等你解锁时是橙色）、有没有开自动解锁、信号格；点进去看信号曲线、登记解锁、「重新连接」；左滑或在详情页「管理」里「忘记」。
+   - 首页「我的电脑」每台一张卡片：连接状态和信号、有没有开自动解锁，右边是锁按钮（显示锁没锁，点了解锁或锁屏，见下面「首页锁按钮」）；点进去看信号曲线、登记解锁、「重新连接」；左滑或在详情页「管理」里「忘记」。
    - 旧版本记住的那一台电脑升级后自动留着。
 4. 状态显示「已连接」后就可以锁屏放兜里。锁屏、切到别的 App 都不影响；**别在多任务界面把它划掉**，划掉后系统不会再在后台唤醒它。
 5. 测试、排查用的东西都在右上角「工具与记录」里：测试通知、本次记录（导出 CSV、新建记录）、iBeacon（实验）、位置标记、手机判断参数。
@@ -37,7 +37,9 @@
 
 App 明确识别 `platform: "darwin"` + `unlock: "ax-hmac-v3"` 和 `platform: "win32"` + `unlock: "win-hmac-v3"` 两组能力，不能混用或仅靠协议版本推断。两端复用同样的 v3 认证 REPORT、CHALLENGE / UNLOCK 字节格式和固定 HMAC 向量。手机对每条报告加入随机数及签名；电脑拒绝无签名、过期或重放的报告。重新连接或电脑重新发布认证服务时会重读 INFO 的报告会话随机数；传输容量不足时暂停自动解锁。
 
-手机只保存 32 字节随机密钥，不接触电脑登录密码。密钥存 `AfterFirstUnlockThisDeviceOnly` 钥匙串，手机重启后必须先解锁一次。每台电脑的 `(reportNonce, promptID)` 只自动尝试一次，去重标记持久保存，重连或 App 重启也不重试；电脑新进程的同编号可再次尝试。失败、断连或超时不自动重试；请求已经发出时断连，界面只说结果尚未确认。手动「解锁」按钮仍可用 Face ID 或手机密码确认。已有 Mac 钥匙串登记在升级后保留。
+手机只保存 32 字节随机密钥，不接触电脑登录密码。密钥存 `AfterFirstUnlockThisDeviceOnly` 钥匙串，手机重启后必须先解锁一次。每台电脑的 `(reportNonce, promptID)` 只自动尝试一次，去重标记持久保存，重连或 App 重启也不重试；电脑新进程的同编号可再次尝试。失败、断连或超时不自动重试；请求已经发出时断连，界面只说结果尚未确认。已有 Mac 钥匙串登记在升级后保留。
+
+**首页锁按钮**：每台电脑右边一个圆按钮，图标和下面的小字是电脑现在锁没锁（等你解锁时是橙色）；锁着时点一下解锁，没锁时点一下锁屏，都不要 Face ID，结果在卡片上显示几秒。电脑没在请提示时也能手动解锁、能锁屏，要电脑端支持（INFO 里 `manual`，见 `docs/protocol.md`「手动锁屏、解锁」，Mac 和 Windows 电脑端 0.1.2 起都支持）；不支持的电脑只在请提示时能点。详情页「靠近自动解锁」里也有「现在解锁这台电脑」「锁定这台电脑」。模拟器里点锁按钮 1 秒后假装成功，假电脑保持那个状态 20 秒。
 
 详情页可删除登记或关闭自动；忘记电脑会删除相应钥匙串登记。密钥不通过蓝牙登记，也不要发送到聊天、日志或共享文档中。Mac 的一次性授权、登记和测试边界见 `../prototype/mac_peer/README.md`；Windows 的组件、本机登记和验收边界见 `../prototype/windows_unlock/README.md`。
 
@@ -93,7 +95,7 @@ xcrun devicectl device copy from --device <设备 identifier> --domain-type appD
 | `ProximityUnlock/EventLog.swift` | 写 CSV |
 | `ProximityUnlock/ContentView.swift` | 首页：要处理的提醒（蓝牙、通知）和电脑卡片 |
 | `ProximityUnlock/ToolsView.swift` | 「工具与记录」：测试通知、本次记录、iBeacon（实验）、位置标记、判断参数 |
-| `ProximityUnlock/ComputerViews.swift` | 电脑卡片、详情页（状态、信号曲线、靠近自动解锁、管理、诊断）、添加电脑，主色 `Color.appAccent`（靛蓝） |
+| `ProximityUnlock/ComputerViews.swift` | 电脑卡片（右边锁按钮 `LockButton`）、详情页（状态、信号曲线、靠近自动解锁、管理、诊断）、添加电脑，主色 `Color.appAccent`（靛蓝） |
 | `ProximityUnlock/EnrollmentScanner.swift` | 扫码登记：VisionKit 扫二维码，只收认得出的登记码 |
 | `ProximityUnlock/Assets.xcassets` | App 图标（`make-icon.swift` 画的） |
 | `Info.plist` | 蓝牙、定位、相机权限说明，后台蓝牙（`bluetooth-central`），在「文件」App 里显示记录 |

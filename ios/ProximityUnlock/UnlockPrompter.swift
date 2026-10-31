@@ -269,7 +269,7 @@ final class UnlockPrompter: NSObject, UNUserNotificationCenterDelegate {
         completionHandler([.banner, .list, .sound])
     }
 
-    /// 普通点击仍只打开 App；已登记电脑的「解锁」动作才进入本机认证和签名流程。
+    /// 普通点击仍只打开 App；已登记电脑的「解锁」动作才进入签名流程（系统先要求手机解锁，见 authenticationRequired）。
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         if let computer = Self.computer(of: response.notification.request.identifier) {

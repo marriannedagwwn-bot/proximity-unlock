@@ -1,5 +1,4 @@
 import CoreBluetooth
-import LocalAuthentication
 import Observation
 import UIKit
 
@@ -24,7 +23,7 @@ private enum DiscoveryStep {
 }
 
 private enum UnlockStep {
-    case authenticating, readingChallenge, writingCommand
+    case readingChallenge, writingCommand
 }
 
 private struct PendingUnlock {
@@ -45,6 +44,13 @@ private struct UnlockRetry {
     let session: Data
     let automatic: Bool
     let sentAt: Date
+}
+
+/// 首页锁按钮（手动解锁、锁屏）的结果，卡片上显示几秒就清掉
+struct ActionFeedback: Equatable {
+    let text: String
+    let failed: Bool
+    let at: Date
 }
 
 private struct PendingReportWrite {
@@ -91,11 +97,17 @@ final class ComputerLink: NSObject, Identifiable {
     private(set) var platform: String?
     private(set) var protoWarning: String?
     private(set) var supportsUnlock = false
+    /// INFO 的 manual ≥ 1：锁着、没在请提示时也能手动解锁，也能让电脑锁屏（docs/protocol.md「手动锁屏、解锁」）
+    private(set) var supportsManual = false
     private(set) var authenticatedReportsReady = false
     private(set) var hasUnlockEnrollment = false
     private(set) var automaticUnlockEnabled = false
     private(set) var unlockBusy = false
     private(set) var unlockStatus: String?
+    /// 正在等电脑回锁屏命令的结果
+    private(set) var lockBusy = false
+    /// 首页锁按钮的结果，几秒后清掉
+    private(set) var actionFeedback: ActionFeedback?
     /// 测试用：下一次签好名的解锁请求不发出去，直接断开连接，模拟「发出后连接断了」，看补发对不对。只生效一次
     private(set) var simulateUnlockDrop = false
     private var unlockTransportReady = false
@@ -134,6 +146,9 @@ final class ComputerLink: NSObject, Identifiable {
     @ObservationIgnored private var unlockCommandChar: CBCharacteristic?
     @ObservationIgnored private var enrollAckChar: CBCharacteristic?
     @ObservationIgnored private var enrollRequestChar: CBCharacteristic?
+    @ObservationIgnored private var lockCommandChar: CBCharacteristic?
+    /// 这一次锁屏命令，回复或超时以后清掉
+    @ObservationIgnored private var lockToken: UUID?
     /// 电脑对「请电脑显示登记码」的回复，扫码页上显示；这次扫码没发请求（电脑端太旧、没连上）是 nil
     private(set) var enrollRequestStatus: String?
     /// 刚保存、还没发登记确认的登记和保存时间（见「登记确认」）
@@ -147,8 +162,6 @@ final class ComputerLink: NSObject, Identifiable {
     @ObservationIgnored private var confirmedAuthenticatedReportAt: Date?
     @ObservationIgnored private var pendingReportWrite: PendingReportWrite?
     @ObservationIgnored private var pendingUnlock: PendingUnlock?
-    @ObservationIgnored private var unlockAuthentication: LAContext?
-    @ObservationIgnored private var unlockActivationObserver: NSObjectProtocol?
     @ObservationIgnored private var lastAutomaticUnlockAttempt: AutomaticUnlockAttempt?
     /// 等着补发的那次请求。只放在内存里：App 中途被结束重新启动就不补（宁可少补）
     @ObservationIgnored private var unlockRetry: UnlockRetry?
@@ -202,6 +215,8 @@ final class ComputerLink: NSObject, Identifiable {
     @ObservationIgnored private var simTimer: Timer?
     @ObservationIgnored private var simSeq: UInt32 = 0
     @ObservationIgnored private var simLevel = -58.0
+    /// 模拟器里点了锁按钮：这台假电脑保持这个状态到某个时间，不按一轮一轮走
+    @ObservationIgnored private var simHold: (state: UInt8, until: Date)?
 
     init(owner: LinkManager, saved: SavedComputer, settings: JudgeSettings, simulated: Bool = false) {
         self.owner = owner
@@ -236,11 +251,39 @@ final class ComputerLink: NSObject, Identifiable {
         (announcedInterval ?? 1) >= Self.dormantInterval
     }
 
-    var canRequestUnlock: Bool {
+    /// 连接、登记、本连接的认证报告都就绪，可以发签名请求（不看电脑状态）
+    private var unlockReady: Bool {
         phase == .connected && subscribed && supportsUnlock && hasUnlockEnrollment && infoRead && authenticatedReportsReady
-            && computerState == ComputerState.promptUnlock && promptID != nil
             && unlockTransportReady
             && !unlockBusy && !unlockReadOutstanding && !unlockWriteOutstanding && !isSimulated
+    }
+
+    /// 电脑在请提示，可以按这次提示解锁（自动解锁、通知上的「解锁」、补发）
+    var canRequestUnlock: Bool {
+        unlockReady && computerState == ComputerState.promptUnlock && promptID != nil
+    }
+
+    /// 首页锁按钮、详情页「现在解锁」：电脑在请提示就按提示解；只是锁着时手动解（电脑端要支持，INFO 的 manual）
+    var canManualUnlock: Bool {
+        if isSimulated {
+            return !unlockBusy && !lockBusy
+                && (computerState == ComputerState.locked || computerState == ComputerState.promptUnlock)
+        }
+        return canRequestUnlock || (unlockReady && supportsManual && computerState == ComputerState.locked)
+    }
+
+    /// 首页锁按钮：电脑没锁屏时让它锁屏。和认证报告一样用登记密钥签名，带最近一次心跳的 seq
+    var canRemoteLock: Bool {
+        if isSimulated { return !unlockBusy && !lockBusy && computerState == ComputerState.unlocked }
+        return phase == .connected && subscribed && supportsManual && lockCommandChar != nil && infoRead
+            && authenticatedReportsReady && unlockEnrollmentCache != nil && lastSeq != nil
+            && computerState == ComputerState.unlocked && !lockBusy && !unlockBusy
+    }
+
+    /// 这次解锁的目标还在：按提示解锁要电脑还在请同一次提示；手动解锁（编号 0）要电脑还锁着、没在请提示
+    private static func unlockTarget(_ id: UInt16, matches state: UInt8?, _ prompt: UInt16?) -> Bool {
+        id == UnlockProtocol.manualPromptID ? state == ComputerState.locked
+            : state == ComputerState.promptUnlock && prompt == id
     }
 
     /// 登记保存到本机钥匙串并默认开启自动解锁；下一次有效的靠近提示可触发一次尝试。
@@ -340,7 +383,7 @@ final class ComputerLink: NSObject, Identifiable {
     // 其实 Mac 已经解锁了。手机回到电脑附近的头几分钟，和 Mac 的连接常常每十几秒超时一次，请求要是没送到，就只能手动解锁。
     // 所以：请求已经发出、在等回复时连接断了（链路断开或电脑端服务变了），重新连上后电脑还在请同一次提示、
     // 认证会话没变（电脑端没重启）、离第一次发出不到 120 秒（电脑那边这次提示的有效期），就重新读挑战、
-    // 用新的一次性签名补发一次。每次提示最多补一次；自动、手动（Face ID 确认过的）都补，手动补发不再要 Face ID。
+    // 用新的一次性签名补发一次。每次提示最多补一次；自动、手动（用户点了解锁的）都补。
     // 不会重复解锁：电脑每个随机数只核对一次，正在执行解锁时不给新挑战，已经解锁就不再是状态 3。
     // 电脑明确回了失败、连着但 30 秒没回复、后台时间用完、用户改了登记或关了自动解锁，都不补。
 
@@ -359,12 +402,14 @@ final class ComputerLink: NSObject, Identifiable {
             skipUnlockRetry("电脑端重启过（认证会话变了），不补发")
             return
         }
-        guard state == ComputerState.promptUnlock, promptID == retry.promptID else {
+        guard Self.unlockTarget(retry.promptID, matches: state, promptID) else {
             skipUnlockRetry(state == ComputerState.unlocked ? "电脑已经解锁了，不用补发"
-                            : "电脑已经不在请这次提示（\(ComputerState.label(state))\(promptID.map { " id=\($0)" } ?? "")），不补发")
+                            : retry.promptID == UnlockProtocol.manualPromptID
+                                ? "电脑已经不是锁着等手动解锁（\(ComputerState.label(state))），不补发"
+                                : "电脑已经不在请这次提示（\(ComputerState.label(state))\(promptID.map { " id=\($0)" } ?? "")），不补发")
             return
         }
-        guard canRequestUnlock else { return }  // 认证报告还没通过等，等下一次心跳
+        guard unlockReady else { return }  // 认证报告还没通过等，等下一次心跳
         unlockRetry = nil
         let token = UUID()
         pendingUnlock = PendingUnlock(token: token, promptID: retry.promptID, step: .readingChallenge,
@@ -372,7 +417,7 @@ final class ComputerLink: NSObject, Identifiable {
         unlockBusy = true
         unlockStatus = "重新连上了，正在补发一次解锁请求…"
         record("unlock_retry", note: String(format: "id=%d，第一次发出后连接断了、结果未确认；电脑还在请这次提示，%.1f 秒后用新的一次性签名补发一次",
-                                            Int(retry.promptID), elapsed) + (retry.automatic ? "" : "（手动确认过的请求，不再要 Face ID）"))
+                                            Int(retry.promptID), elapsed) + (retry.automatic ? "" : "（用户点了解锁的请求）"))
         readUnlockChallenge(token, promptID: retry.promptID)
     }
 
@@ -406,62 +451,39 @@ final class ComputerLink: NSObject, Identifiable {
         readUnlockChallenge(token, promptID: currentID)
     }
 
-    /// 只允许详情页按钮或通知的明确动作进入；普通心跳永远不会调用。
+    /// 只允许首页锁按钮、详情页按钮或通知的明确动作进入；普通心跳永远不会调用。
+    /// 电脑在请提示就按这次提示解；只是锁着（没在请提示）时手动解锁，编号 0（通知带着编号，不走手动）
     func requestUnlock(promptID requestedID: UInt16? = nil) {
-        guard canRequestUnlock, let currentID = promptID,
-              requestedID == nil || requestedID == currentID else {
-            unlockStatus = unlockBusy ? "本次解锁正在处理，请等待结果。" : "当前没有可确认的解锁提示，请检查连接和登记。"
+#if targetEnvironment(simulator)
+        if isSimulated {
+            simulateAction(unlock: true)
             return
         }
-        let context = LAContext()
-        context.touchIDAuthenticationAllowableReuseDuration = 0
-        context.localizedCancelTitle = "取消解锁"
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
-            unlockStatus = "无法确认手机用户，请检查 Face ID 或手机密码设置。"
-            return
-        }
-        let token = UUID()
-        pendingUnlock = PendingUnlock(token: token, promptID: currentID, step: .authenticating, automatic: false)
-        unlockAuthentication = context
-        unlockBusy = true
-        unlockStatus = "请在手机上确认解锁。"
-        record("unlock_auth", note: "id=\(currentID)，用户请求确认")
-        armUnlockTimeout(token, step: .authenticating, seconds: 60)
-        // 通知的 foreground 动作可能在 didBecomeActive 之前送达，等界面活跃再显示手机认证。
-        if UIApplication.shared.applicationState == .active {
-            authenticateUnlock(token, context: context)
+#endif
+        let currentID: UInt16
+        if canRequestUnlock, let id = promptID, requestedID == nil || requestedID == id {
+            currentID = id
+        } else if requestedID == nil, canManualUnlock, computerState == ComputerState.locked {
+            currentID = UnlockProtocol.manualPromptID
         } else {
-            unlockActivationObserver = NotificationCenter.default.addObserver(
-                forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
-            ) { [weak self] _ in
-                guard let self else { return }
-                if let observer = self.unlockActivationObserver { NotificationCenter.default.removeObserver(observer) }
-                self.unlockActivationObserver = nil
-                guard self.pendingUnlock?.token == token else { return }
-                self.authenticateUnlock(token, context: context)
-            }
+            unlockStatus = unlockBusy ? "本次解锁正在处理，请等待结果。"
+                : supportsManual ? "现在解锁不了：要连着电脑、登记过解锁，电脑锁着屏。" : "当前没有可确认的解锁提示，请检查连接和登记。"
+            showFeedback(unlockStatus ?? "", failed: true)
+            return
         }
-    }
-
-    private func authenticateUnlock(_ token: UUID, context: LAContext) {
-        guard let currentID = pendingUnlock?.promptID else { return }
-        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "确认解锁\(name ?? "这台电脑")") { [weak self] allowed, _ in
-            DispatchQueue.main.async {
-                guard let self, self.pendingUnlock?.token == token else { return }
-                guard allowed else {
-                    self.finishUnlock("已取消解锁。", result: "手机用户未确认")
-                    return
-                }
-                self.readUnlockChallenge(token, promptID: currentID)
-            }
-        }
+        // 不要 Face ID：能打开 App 说明手机已经解锁了，和自动解锁一样直接发签名请求
+        let token = UUID()
+        pendingUnlock = PendingUnlock(token: token, promptID: currentID, step: .readingChallenge, automatic: false)
+        unlockBusy = true
+        record("unlock_manual", note: currentID == UnlockProtocol.manualPromptID
+               ? "手动解锁（电脑锁着、没在请提示），用户点了解锁" : "id=\(currentID)，用户点了解锁")
+        readUnlockChallenge(token, promptID: currentID)
     }
 
     private func readUnlockChallenge(_ token: UUID, promptID currentID: UInt16) {
         guard pendingUnlock?.token == token,
               phase == .connected, subscribed, supportsUnlock,
-              computerState == ComputerState.promptUnlock, promptID == currentID,
+              Self.unlockTarget(currentID, matches: computerState, promptID),
               let p = peripheral, let challenge = unlockChallengeChar else {
             finishUnlock("电脑状态或连接已变化，本次请求已取消。", result: "读取前状态已变化")
             return
@@ -514,17 +536,14 @@ final class ComputerLink: NSObject, Identifiable {
         }
     }
 
-    private func finishUnlock(_ message: String, result: String) {
+    private func finishUnlock(_ message: String, result: String, succeeded: Bool = false) {
         let old = pendingUnlock
         pendingUnlock = nil
-        unlockAuthentication?.invalidate()
-        unlockAuthentication = nil
-        if let observer = unlockActivationObserver { NotificationCenter.default.removeObserver(observer) }
-        unlockActivationObserver = nil
         unlockBusy = false
         unlockStatus = message
         endUnlockBackgroundTask()
         if let old { record("unlock_result", note: "id=\(old.promptID)，\(result)") }
+        if let old, !old.automatic { showFeedback(message, failed: !succeeded) }
     }
 
     /// linkReset：连接断了或电脑端服务变了（resetLink），已发出的请求可以补发一次
@@ -565,7 +584,7 @@ final class ComputerLink: NSObject, Identifiable {
             return
         }
         guard supportsUnlock, hasUnlockEnrollment,
-              computerState == ComputerState.promptUnlock, promptID == request.promptID,
+              Self.unlockTarget(request.promptID, matches: computerState, promptID),
               let p = peripheral, p.state == .connected, let command = unlockCommandChar else {
             finishUnlock("电脑状态或连接已变化，本次请求已取消。", result: "签名前状态已变化")
             return
@@ -575,7 +594,8 @@ final class ComputerLink: NSObject, Identifiable {
                 hasUnlockEnrollment = false
                 throw UnlockAuthorizationError.invalidEnrollment
             }
-            let payload = try enrollment.request(challenge: data, expectedPromptID: request.promptID)
+            let payload = try enrollment.request(challenge: data, expectedPromptID: request.promptID,
+                                                 manual: request.promptID == UnlockProtocol.manualPromptID)
             guard command.properties.contains(.write), p.maximumWriteValueLength(for: .withResponse) >= payload.count else {
                 finishUnlock("电脑不支持有回复的解锁请求。", result: "解锁特征不支持写回复")
                 return
@@ -606,7 +626,8 @@ final class ComputerLink: NSObject, Identifiable {
         if let error = error as NSError? {
             let reason: String
             switch error.domain == CBATTErrorDomain ? error.code : -1 {
-            case 0x80: reason = "电脑上的解锁提示已失效"
+            case 0x80: reason = pendingUnlock?.promptID == UnlockProtocol.manualPromptID
+                ? "电脑现在不接受手动解锁（已经解锁了，或者连接还没认证好）" : "电脑上的解锁提示已失效"
             case 0x81: reason = "解锁登记不匹配，请重新登记"
             case 0x82: reason = "解锁挑战已过期或已使用"
             case 0x83: reason = "电脑未能完成解锁，请在电脑上检查密码和辅助功能权限"
@@ -614,7 +635,7 @@ final class ComputerLink: NSObject, Identifiable {
             }
             finishUnlock(reason + "；本次不会自动重试。", result: reason)
         } else {
-            finishUnlock("电脑已确认解锁。", result: "电脑确认已解锁")
+            finishUnlock("电脑已确认解锁。", result: "电脑确认已解锁", succeeded: true)
         }
     }
 
@@ -965,6 +986,10 @@ final class ComputerLink: NSObject, Identifiable {
         unlockCommandChar = nil
         enrollAckChar = nil
         enrollRequestChar = nil
+        lockCommandChar = nil
+        if lockToken != nil {
+            finishLock("连接断了，没收到锁屏结果，请看一下电脑。", failed: true, result: "连接断了，锁屏结果未确认")
+        }
         unlockTransportReady = false
         unlockReadOutstanding = false
         unlockWriteOutstanding = false
@@ -1135,8 +1160,7 @@ final class ComputerLink: NSObject, Identifiable {
 
     /// 电脑状态变了记一行；状态 3 + 新编号弹通知、不再是 3 撤掉通知交给 UnlockPrompter（每台电脑一条通知）
     private func onComputerState(_ hb: Heartbeat) {
-        if let request = pendingUnlock,
-           hb.computerState != ComputerState.promptUnlock || hb.promptID != request.promptID {
+        if let request = pendingUnlock, !Self.unlockTarget(request.promptID, matches: hb.computerState, hb.promptID) {
             if request.step == .writingCommand && hb.computerState == ComputerState.unlocked {
                 // 普通心跳的锁屏检测可能暂时未知；只有 UNLOCK 的写回复才确认本次认证结果。
                 unlockStatus = "电脑状态已变化，正在等待解锁结果…"
@@ -1285,6 +1309,7 @@ final class ComputerLink: NSObject, Identifiable {
         if let oldNonce = unlockReportSessionNonce, oldNonce != nonce { invalidateUnlockReportSession() }
         resetAuthenticatedReportConfirmation()
         supportsUnlock = UnlockCapability.supports(platform: info.platform, capability: info.unlock)
+        supportsManual = supportsUnlock && (info.manual ?? 0) >= 1
         unlockReportSessionNonce = nonce
         if !supportsUnlock { unlockReportSessionNonce = nil; unlockEnrollmentCache = nil }
         updateAuthenticatedReportsReady()
@@ -1296,6 +1321,78 @@ final class ComputerLink: NSObject, Identifiable {
             protoWarning = nil
         }
         sendEnrollAckIfReady()
+    }
+
+    // MARK: - 手机让电脑锁屏
+    //
+    // 首页锁按钮在电脑没锁屏时用（docs/protocol.md「手动锁屏、解锁」）。和认证报告一样用登记密钥签名，
+    // 带最近一次收到的心跳 seq：电脑核对是它刚发过的、包没重放过，不用先读挑战。锁屏和解锁都不要 Face ID。
+    // 电脑那边当作用户自己锁的屏：手机一直在旁边不会请提示，回到电脑前要在手机上手动解锁
+
+    func requestLock() {
+#if targetEnvironment(simulator)
+        if isSimulated {
+            simulateAction(unlock: false)
+            return
+        }
+#endif
+        guard canRemoteLock, let p = peripheral, let c = lockCommandChar, let seq = lastSeq,
+              let nonce = unlockReportSessionNonce, let enrollment = unlockEnrollmentCache else {
+            showFeedback(lockBusy ? "正在等电脑回复。" : "现在锁不了：要连着电脑、登记过解锁，电脑端要能接收锁屏命令。", failed: true)
+            return
+        }
+        let payload: Data
+        do {
+            payload = try enrollment.lockCommand(seq: seq, sessionNonce: nonce, packetNonce: UnlockEnrollment.randomReportNonce())
+        } catch {
+            showFeedback(error.localizedDescription, failed: true)
+            return
+        }
+        guard c.properties.contains(.write), p.maximumWriteValueLength(for: .withResponse) >= payload.count else {
+            showFeedback("电脑不支持有回复的锁屏命令。", failed: true)
+            return
+        }
+        let token = UUID()
+        lockToken = token
+        lockBusy = true
+        record("lock_sent", seq: seq, note: "请电脑锁屏")
+        p.writeValue(payload, for: c, type: .withResponse)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.lockToken == token else { return }
+            self.finishLock("锁屏结果没返回，请看一下电脑。", failed: true, result: "10 秒没回复")
+        }
+    }
+
+    private func onLockWritten(_ error: Error?) {
+        guard lockToken != nil else { return }
+        guard let error = error as NSError? else {
+            finishLock("电脑已锁屏。", failed: false, result: "电脑确认已锁屏")
+            return
+        }
+        let reason: String
+        switch error.domain == CBATTErrorDomain ? error.code : -1 {
+        case 0x80: reason = "电脑现在不接受锁屏命令（连接还没认证好），过一会儿再试"
+        case 0x81: reason = "解锁登记不匹配，请重新登记"
+        case 0x82: reason = "锁屏命令过期了，再点一次"
+        case 0x83: reason = "电脑没能锁屏"
+        default: reason = "电脑没收下锁屏命令，请检查连接"
+        }
+        finishLock(reason + "。", failed: true, result: reason + "：" + error.localizedDescription)
+    }
+
+    private func finishLock(_ message: String, failed: Bool, result: String) {
+        lockToken = nil
+        lockBusy = false
+        showFeedback(message, failed: failed)
+        record("lock_result", note: result)
+    }
+
+    private func showFeedback(_ text: String, failed: Bool) {
+        let feedback = ActionFeedback(text: text, failed: failed, at: Date())
+        actionFeedback = feedback
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            if self?.actionFeedback == feedback { self?.actionFeedback = nil }
+        }
     }
 
     // MARK: - 登记确认
@@ -1414,7 +1511,7 @@ extension ComputerLink: CBPeripheralDelegate {
         }
         discovery = .characteristics
         p.discoverCharacteristics([Proto.heartbeat, Proto.report, Proto.info, Proto.unlockChallenge, Proto.unlockCommand,
-                                   Proto.enrollAck, Proto.enrollRequest], for: service)
+                                   Proto.enrollAck, Proto.enrollRequest, Proto.lockCommand], for: service)
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
@@ -1438,6 +1535,7 @@ extension ComputerLink: CBPeripheralDelegate {
         unlockTransportReady = unlockChallengeChar != nil && unlockCommandChar != nil
         enrollAckChar = chars.first { $0.uuid == Proto.enrollAck && $0.properties.contains(.write) }
         enrollRequestChar = chars.first { $0.uuid == Proto.enrollRequest && $0.properties.contains(.write) }
+        lockCommandChar = chars.first { $0.uuid == Proto.lockCommand && $0.properties.contains(.write) }
         // 电脑可以在底层连接保持时重新发布服务启用/停用解锁。仅在特征有↔无变化且
         // 与已经读过的能力不一致，或认证服务实例更换时重读 INFO；普通重复服务通知不触发。
         let unlockPresenceChanged = lastDiscoveredUnlockTransport.map { $0 != unlockTransportReady } ?? false
@@ -1536,6 +1634,10 @@ extension ComputerLink: CBPeripheralDelegate {
             onEnrollRequestWritten(error)
             return
         }
+        if c.uuid == Proto.lockCommand {
+            onLockWritten(error)
+            return
+        }
         if c.uuid == Proto.report { onReportWritten(c, error: error) }
         guard let error else { return }
         owner.stats.writeErrors += 1
@@ -1585,12 +1687,29 @@ extension ComputerLink {
         }
     }
 
+    /// 点了锁按钮：1 秒后假装电脑回了成功，之后 20 秒保持解锁或锁屏
+    func simulateAction(unlock: Bool) {
+        if unlock { unlockBusy = true } else { lockBusy = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            self.unlockBusy = false
+            self.lockBusy = false
+            let state = unlock ? ComputerState.unlocked : ComputerState.locked
+            self.simHold = (state, Date().addingTimeInterval(20))
+            self.showFeedback(unlock ? "电脑已确认解锁。" : "电脑已锁屏。", failed: false)
+            self.onComputerState(Heartbeat(seq: self.simSeq, computerState: state, promptID: self.promptID, nextWithin: 1))
+        }
+    }
+
     private func simulateHeartbeat(cycle: UInt32) {
         simSeq &+= 1
         // 一轮里前 3/8 未锁屏、接着 1/4 已锁屏、最后 3/8 请提示解锁（40 秒一轮就是 15、10、15 秒）
         let phase = simSeq % cycle
-        let state = phase < cycle * 3 / 8 ? ComputerState.unlocked
+        var state = phase < cycle * 3 / 8 ? ComputerState.unlocked
             : phase < cycle * 5 / 8 ? ComputerState.locked : ComputerState.promptUnlock
+        if let hold = simHold {
+            if Date() < hold.until { state = hold.state } else { simHold = nil }
+        }
         onHeartbeat(Heartbeat(seq: simSeq, computerState: state, promptID: UInt16(truncatingIfNeeded: simSeq / cycle + 1),
                               nextWithin: 1))
         simLevel = min(-45, max(-90, simLevel + Double.random(in: -2.5...2.5)))

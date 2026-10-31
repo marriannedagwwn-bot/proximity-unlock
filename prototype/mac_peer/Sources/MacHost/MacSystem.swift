@@ -65,6 +65,23 @@ public final class MacSystem: HostSystem {
         return (true, "")
     }
 
+    /// 和 Windows 的 DisplayState 对应。Power Nap 的维护唤醒（深色唤醒）时系统没有图形能力，显示器不亮
+    /// （IOPMrootDomain 的「System Capabilities」：1 CPU、2 图形、4 声音、8 网络）；醒着时再看主显示器睡没睡。
+    /// 没接显示器时 nil
+    public func displayAsleep() -> Bool? {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        if root != 0 {
+            defer { IOObjectRelease(root) }
+            if let caps = IORegistryEntryCreateCFProperty(root, "System Capabilities" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? Int, caps & 2 == 0 {
+                return true
+            }
+        }
+        var displays: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &displays) == .success, displays > 0 else { return nil }
+        return CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
     public func unlockScreen(password: String) async -> (ok: Bool, note: String) {
         await unlockWorkflow.unlock(password: password)
     }

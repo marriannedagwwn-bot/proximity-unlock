@@ -15,6 +15,7 @@ DerivedData/
 
 # 本机签名设置（证书、描述文件因人而异）
 *.local.xcconfig
+prototype/mac_peer/signing.local
 build/
 
 # 电脑端卡死时守护进程抓的现场

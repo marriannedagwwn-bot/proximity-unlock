@@ -36,6 +36,21 @@ struct UnlockAuthorizationTests {
         try rejected { _ = try enrollment.request(challenge: Data(challenge.dropLast()), expectedPromptID: 0x1234) }
         try rejected { _ = try enrollment.request(challenge: challenge + Data([0]), expectedPromptID: 0x1234) }
         try rejected { _ = try enrollment.request(challenge: Data(repeating: 0, count: 18), expectedPromptID: 0) }
+
+        // 手动解锁：编号 0 要明确说是手动；和 Mac 电脑端 UnlockProtocolTests 同一个向量（Python hmac 独立算的）
+        var manualChallenge = Data([0x00, 0x00])
+        manualChallenge.append(contentsOf: (0..<16).map(UInt8.init))
+        let manualRequest = try enrollment.request(challenge: manualChallenge, expectedPromptID: 0, manual: true)
+        precondition(manualRequest.map { String(format: "%02x", $0) }.joined() == "1234567800004a778d2cb1f5141a5d8edd20c871dac0")
+        try rejected { _ = try enrollment.request(challenge: challenge, expectedPromptID: 0x1234, manual: true) }
+        try rejected { _ = try enrollment.request(challenge: challenge, expectedPromptID: 0, manual: true) }
+
+        // 让电脑锁屏：和 Mac 电脑端 testLockCommandVectorAndGate 同一个向量
+        let lock = try enrollment.lockCommand(seq: 0x11223344, sessionNonce: Data((0..<16).map(UInt8.init)),
+                                              packetNonce: Data((0..<8).map(UInt8.init)))
+        precondition(lock.map { String(format: "%02x", $0) }.joined()
+                     == "12345678443322110001020304050607442b75904bb993b827ddb143ec6926a8")
+        try rejected { _ = try enrollment.lockCommand(seq: 1, sessionNonce: Data(count: 15), packetNonce: Data(count: 8)) }
         try rejected { _ = try UnlockEnrollment.parse("{\"version\":2,\"keyID\":1,\"secret\":\"\(secret.base64EncodedString())\"}") }
         try rejected { _ = try UnlockEnrollment.parse("{\"version\":1,\"keyID\":1,\"secret\":\"\(secret.dropLast().base64EncodedString())\"}") }
         try rejected { _ = try UnlockEnrollment.parse("invalid") }

@@ -7,7 +7,7 @@
 #   prototype/mac_peer/autostart.sh status     在不在跑、最近的日志
 #   prototype/mac_peer/autostart.sh uninstall  停止并删掉，以后登录不再启动
 #
-# - launchd 直接运行 MacPeer.app 里的程序，蓝牙权限算 MacPeer 自己的（第一次或重新编译后系统可能再问一次，点「允许」）。
+# - launchd 直接运行 MacPeer.app 里的程序，蓝牙权限算 MacPeer 自己的（第一次或签名变了以后系统会再问一次，点「允许」）。
 # - 意外退出（崩溃、被强制结束）launchd 隔 30 秒重启；正常退出（stop、Ctrl+C、同时开了第二份）不重启。
 # - 只允许运行一份：手动 run.sh 再开一份会直接退出。
 # - 日志在 ~/Library/Logs/proximity-unlock/：peer_*.csv 是事件，mac_peer_stdout.txt 是原来打印到终端的内容。
@@ -100,7 +100,7 @@ EOF
     echo "已装上：每次登录后在后台启动 Mac 电脑端，现在已经启动。日志在 $LOGDIR"
     sleep 3
     status
-    # 自动解锁要辅助功能、发送系统事件权限；重签以后会失效（见 build.sh）。用 open 启动才算 MacPeer 自己的权限
+    # 自动解锁要辅助功能、发送系统事件权限；签名变了以后会失效（见 build.sh）。用 open 启动才算 MacPeer 自己的权限
     CHECK="$(mktemp)"
     open -W -n --stdout "$CHECK" --stderr "$CHECK" "$APP" --args --screen-status 2>/dev/null || true
     grep -v "Unable to block" "$CHECK" || true

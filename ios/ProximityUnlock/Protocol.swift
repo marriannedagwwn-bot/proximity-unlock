@@ -16,6 +16,8 @@ enum Proto {
     static let enrollAck = CBUUID(string: "be282b23-6b55-4b86-86ea-b7f8f3c273e3")
     /// 请电脑显示登记码（ENROLL_REQUEST）：点「扫码登记」时写一次 0x01，电脑先确认再弹出二维码。有没有登记都有
     static let enrollRequest = CBUUID(string: "3465d7ce-93d4-4d36-9c16-0619b8ebadbf")
+    /// 手机让电脑锁屏（LOCK，docs/protocol.md「手动锁屏、解锁」）：首页锁按钮。INFO 里 `manual` ≥ 1 的电脑才有
+    static let lockCommand = CBUUID(string: "10c0be5d-68ca-44bd-87ce-a2e42e9604da")
 
     /// 电脑发的 iBeacon 的 UUID（实验，docs/protocol.md「用 iBeacon 拉起 App（实验）」）。major、minor 还没定，App 只按 UUID 监测
     static let beaconUUID = UUID(uuidString: "9E698AEC-9C56-46E3-9209-F2628704D932")!
@@ -109,4 +111,6 @@ struct ComputerInfo: Decodable {
     let unlock: String?
     /// v3 每次电脑端进程启动重新生成的 16 字节随机数（base64），认证 RSSI 报告使用。
     let reportNonce: String?
+    /// ≥ 1：电脑锁着、没在请提示时也能手动解锁（挑战编号 0），也能让手机锁屏（docs/protocol.md「手动锁屏、解锁」）
+    let manual: Int?
 }
