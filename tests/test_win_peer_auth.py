@@ -121,7 +121,8 @@ class PeerAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                         far_th=-80, far_for=10, lost_for=10, active=30,
                         idle_lock=60, awake_minutes=30, screen="dim",
                         approach_th=-72, approach_gain=10, approach_for=3,
-                        cancel_after=60, dormant_after=1800, slow_th=-75)
+                        cancel_after=60, dormant_after=1800, slow_th=-75,
+                        freeze_away=60)
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 

@@ -23,6 +23,12 @@ class FakeAwake:
         return True
 
 
+class FakeDisplay:
+    def __init__(self):
+        self.on = True
+        self.registered = True
+
+
 class JudgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -39,6 +45,7 @@ class JudgeTests(unittest.TestCase):
         self.get_brightness = self.enterContext(patch.object(m, "get_brightness", return_value=67))
         self.set_brightness = self.enterContext(patch.object(m, "set_brightness", return_value=True))
         self.enterContext(patch.object(m, "KeepAwake", FakeAwake))
+        self.enterContext(patch.object(m, "DisplayState", FakeDisplay))
         self.enterContext(patch.object(m.Peer, "say"))
 
     def write_log(self, name, *rows):
@@ -60,7 +67,8 @@ class JudgeTests(unittest.TestCase):
             lock=True, no_auto_unlock=backend is None, interval=1, slow_interval=3, dormant_interval=30,
             restart=restart, ref_window=900, pause_after=3, startup_grace=30, far_th=-80, far_for=10,
             lost_for=10, active=30, idle_lock=60, awake_minutes=30, screen="dim", approach_th=-72,
-            approach_gain=10, approach_for=3, cancel_after=60, dormant_after=1800, slow_th=-75)
+            approach_gain=10, approach_for=3, cancel_after=60, dormant_after=1800, slow_th=-75,
+            freeze_away=60)
         with patch.object(m, "load_backend", return_value=backend):
             w = m.Peer(args)
         self.addCleanup(w.file.close)
@@ -123,6 +131,18 @@ class JudgeTests(unittest.TestCase):
         w = self.worker(backend=backend)
         self.assertTrue(w.judge.phone_known)
         self.assertIn("登记过解锁的手机", dict(self.logged(w))["phone_known"])
+
+    def test_corrupted_log_rows_do_not_break_startup(self):
+        # 守护进程和工作进程同时写日志撞在一起，留下半个汉字，之后每次启动读到这里就崩
+        self.write_log("peer_20261024_080000_win32.csv", (3600, "report", ""))
+        self.write_log("peer_20261024_220000_win32.csv", (100, "report", ""), (90, "lock", ""))
+        broken = "程冻结了），给工作进程 10s\r\n".encode("utf-8")[2:]
+        for name in ("peer_20261024_080000_win32.csv", "peer_20261024_220000_win32.csv"):
+            with open(Path(self.folder) / name, "ab") as f:
+                f.write(broken + b"not-a-time,0,lock,,,,,,\r\n" + b"not-a-time,0,report,1,-50,1,,,\r\n")
+        w = self.worker(restart=1)
+        self.assertTrue(w.judge.phone_known)
+        self.assertIsNotNone(w.judge.away_at)  # 接上了 90 秒前那次判定离开，坏的那行 lock 跳过
 
     # ---------------------------------------------------------------- 手机走后只锁一次
 
@@ -251,6 +271,141 @@ class JudgeTests(unittest.TestCase):
         self.assertIn("keep_awake", self.events(w))
         self.set_brightness.assert_called_once_with(0)
         self.assertEqual(w.judge.saved_brightness, 67)
+
+    # ---------------------------------------------------------------- 判定离开不等于走远过
+
+    @staticmethod
+    def signal(w, rssi, seconds):
+        """最近 seconds 秒每秒一条报告，信号 rssi；接在已有的报告后面"""
+        w.clients = {"phone": "Phone"}
+        w.last_report_wall = time.time()
+        w.reports = [r for r in w.reports if r[0] < w.now() - seconds] + \
+                    [(w.now() - i, rssi, 1, 10) for i in range(seconds - 1, -1, -1)]
+        w.judge.lost_since = None
+
+    def test_brief_dip_while_locked_does_not_prompt(self):
+        # 屏保早就锁了、手机在别的房间，信号跌到 -86 十几秒又回到 -70：判定离开（本来就锁着），但还不算走远过。
+        # 原来判定离开那一刻就算走远过，「强 10 dB」被跳过，回到 -72 就自动解锁了，其实没人用
+        w = self.worker()
+        self.locked.return_value = True
+        self.signal(w, -75, 600)
+        self.signal(w, -86, 15)
+        w.judge.weak_since = time.time() - 15
+        w.judge.update()
+        self.assertIn("本来就锁着", dict(self.logged(w))["lock"])
+        self.assertFalse(w.judge.armed)
+        self.signal(w, -70, 30)
+        w.judge.near_since = time.time() - 5
+        w.judge.update()
+        self.assertNotIn("prompt", self.events(w))
+        self.assertEqual(w.judge.host_state(), 2)
+        self.signal(w, -88, 90)               # 这次真走远了
+        w.judge.weak_since = time.time() - 90
+        w.judge.update()
+        self.assertTrue(w.judge.armed)
+        self.signal(w, -60, 8)
+        w.judge.near_since = time.time() - 5
+        w.judge.update()
+        self.assertIn("比走远时（-88）", dict(self.logged(w))["prompt"])
+
+    def test_brief_disconnect_while_locked_does_not_prompt(self):
+        # 手机在屋里（-72），连接超时断了十几秒又连回：判定离开（手机失联），但没走远满 60 秒，连回来不提示
+        w = self.worker()
+        w.last_report_wall = time.time() - 15
+        self.locked.return_value = True
+        self.phone_gone(w, seconds=15)
+        w.judge.update()
+        self.assertIn("手机失联", dict(self.logged(w))["lock"])
+        self.assertFalse(w.judge.armed)
+        self.phone_back(w, rssi=-66)
+        w.judge.update()
+        self.assertNotIn("prompt", self.events(w))
+        self.phone_gone(w, seconds=70)        # 这次断了 1 分多钟（出门）
+        w.judge.update()
+        self.assertTrue(w.judge.armed)
+        self.phone_back(w, rssi=-66)
+        w.judge.update()
+        self.assertIn("prompt", self.events(w))
+
+    # ---------------------------------------------------------------- 待机冻住
+
+    @staticmethod
+    def thaw(w, frozen=2341):
+        """电脑端被待机冻住 frozen 秒、刚醒：上次判断是 frozen 秒前，手机还没连回来"""
+        w.judge.last_update = time.time() - frozen
+        w.clients = {}
+
+    def test_frozen_while_walking_away_prompts_when_woken_locked(self):
+        # 走开时合了盖，冻住前还没判定离开；按电源键醒来，锁着，手机马上连回
+        w = self.worker()
+        w.last_report_wall = time.time() - 2341
+        self.locked.return_value = True
+        self.thaw(w)
+        w.judge.update()
+        self.lock.assert_not_called()          # 本来就锁着，没判定离开
+        self.assertTrue(w.judge.armed)
+        self.assertIn("freeze_away", self.events(w))
+        self.assertAlmostEqual(w.judge.ref_start, time.time() - 2341, delta=2)
+        self.phone_back(w, rssi=-60)
+        w.judge.update()
+        self.assertTrue(w.judge.prompting)
+        self.assertIn("之前一段没有报告", dict(self.logged(w))["prompt"])
+        self.locked.return_value = False       # 自动解锁
+        w.judge.update()
+        self.assertIn("提示后", dict(self.logged(w))["back"])
+        self.assertFalse(w.judge.armed)
+
+    def test_maintenance_wake_with_display_off_waits_for_display(self):
+        # 每小时一次的维护唤醒显示器不亮、盖子可能合着：手机在旁边也先不提示
+        w = self.worker()
+        self.locked.return_value = True
+        w.judge.display.on = False
+        self.thaw(w, frozen=3600)
+        w.judge.update()
+        self.assertFalse(w.judge.armed)
+        self.assertIn("显示器没亮", dict(self.logged(w))["freeze_wait"])
+        self.phone_back(w, rssi=-55)
+        w.judge.update()
+        self.thaw(w, frozen=600)               # 又冻住、又是维护唤醒：只记一次
+        w.judge.update()
+        self.assertFalse(w.judge.prompting)
+        self.assertEqual(self.events(w).count("freeze_wait"), 1)
+        w.judge.display.on = True              # 按了电源键
+        self.phone_back(w, rssi=-55)
+        w.judge.update()
+        self.assertIn("freeze_away", self.events(w))
+        self.assertTrue(w.judge.prompting)
+        self.assertIn(datetime.fromtimestamp(time.time() - 3600).strftime("%H:%M"),
+                      dict(self.logged(w))["freeze_away"])  # 从第一次冻住算起
+
+    def test_short_gap_or_unlocked_wake_does_not_arm(self):
+        w = self.worker()
+        self.locked.return_value = True
+        self.thaw(w, frozen=30)                # 没到 --freeze-away
+        w.judge.update()
+        self.locked.return_value = False
+        self.thaw(w)                           # 醒来没锁（不用密码唤醒），不用解锁
+        w.judge.update()
+        self.assertFalse(w.judge.armed)
+        self.assertIsNone(w.judge.frozen_since)
+        self.assertNotIn("freeze_away", self.events(w))
+        self.assertNotIn("freeze_wait", self.events(w))
+
+    def test_manual_unlock_while_waiting_for_display_clears_freeze(self):
+        w = self.worker()
+        self.locked.return_value = True
+        w.judge.display.on = False
+        self.thaw(w)
+        w.judge.update()
+        self.assertIsNotNone(w.judge.frozen_since)
+        self.locked.return_value = False       # 手动解开了
+        w.judge.update()
+        self.assertIsNone(w.judge.frozen_since)
+        w.judge.display.on = True
+        self.locked.return_value = True        # 之后再锁（Win+L，人还坐着）：不当作冻住过
+        w.judge.update()
+        self.assertFalse(w.judge.armed)
+        self.assertNotIn("freeze_away", self.events(w))
 
 
 if __name__ == "__main__":

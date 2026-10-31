@@ -267,6 +267,45 @@ class KeepAwake:
         return ok
 
 
+_DEVICE_NOTIFY_CALLBACK_ROUTINE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p)
+
+
+class _DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS(ctypes.Structure):
+    _fields_ = [("Callback", _DEVICE_NOTIFY_CALLBACK_ROUTINE), ("Context", ctypes.c_void_p)]
+
+
+class DisplayState:
+    """
+    显示器亮没亮（GUID_CONSOLE_DISPLAY_STATE）。系统在注册时报一次当前状态，之后每次变化回调一次（在系统的线程里）。
+    on：True 亮（包括变暗），False 关，None 还不知道（订阅失败）。
+    用来分开"人按电源键、开盖、动鼠标叫醒的"和每小时一次的维护唤醒（显示器不亮，盖子可能合着）
+    """
+    GUID_CONSOLE_DISPLAY_STATE = uuid.UUID("6fe69556-704a-47a0-8f24-c28d936fda47").bytes_le
+    DEVICE_NOTIFY_CALLBACK, PBT_POWERSETTINGCHANGE = 2, 0x8013
+
+    def __init__(self):
+        self.on = None
+        # 回调、参数结构体、GUID 都要一直留着，系统会一直用
+        self._callback = _DEVICE_NOTIFY_CALLBACK_ROUTINE(self._changed)
+        self._params = _DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS(self._callback, None)
+        self._guid = ctypes.create_string_buffer(self.GUID_CONSOLE_DISPLAY_STATE, 16)
+        self._handle = ctypes.c_void_p()
+        try:
+            register = ctypes.windll.powrprof.PowerSettingRegisterNotification
+            register.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+            register.restype = ctypes.c_ulong
+            self.registered = register(self._guid, self.DEVICE_NOTIFY_CALLBACK,
+                                       ctypes.byref(self._params), ctypes.byref(self._handle)) == 0
+        except (OSError, AttributeError):
+            self.registered = False
+
+    def _changed(self, context, kind, setting):
+        if kind == self.PBT_POWERSETTINGCHANGE and setting:
+            # POWERBROADCAST_SETTING：GUID（16 字节）、DataLength（4 字节）、Data（DWORD：0 关、1 亮、2 变暗）
+            self.on = ctypes.c_ulong.from_address(setting + 20).value != 0
+        return 0
+
+
 def turn_off_display():
     """关显示器（SC_MONITORPOWER = 2）。只关屏、不睡眠，蓝牙照常工作；动一下鼠标键盘就亮。
     用 PostMessage 不用 SendMessage：广播给所有窗口，有窗口卡住时 SendMessage 会跟着卡住"""
@@ -284,6 +323,8 @@ class Judge:
     - 锁屏期间手机走远过（armed），之后信号回到 --approach-th 以上、并且比走远时的信号（reference）
       强 --approach-gain → 请手机提示解锁（prompt，心跳里电脑状态 3）。
       用户自己锁屏、人还坐着时手机一直在附近，不会 armed，所以不提示
+    - 电脑端被冻住（合盖、关屏进的待机）超过 --freeze-away 秒、醒来时锁着、显示器亮了：冻住期间看不到手机走没走，
+      当作手机走远过（armed），手机在旁边就请提示（freeze_away）
     - 解锁（--no-lock 时是又有了键盘鼠标操作）→ 记 back，写提示后多久解锁
     """
 
@@ -316,6 +357,11 @@ class Judge:
         self.dim_after_cancel = False  # 请提示时恢复了亮度：提示撤销（手机又走远）时再调暗
         self.phone_known = False   # 以前收到过手机报告（7 天内）或登记过解锁，见 restore_history
         self.hold_lock = False     # 手机走后锁过一次、手机还没回来就被解开了（多半是远程解的）：手机回来以前不再自动锁
+        self.last_update = None    # 上次判断的时间：隔了很久说明电脑端被待机冻住了
+        self.frozen_since = None   # 冻住后醒来时锁着、等显示器亮了再当作手机走远过：冻住是从什么时候开始的
+        self.display = DisplayState()
+        if not self.display.registered:
+            peer.log("freeze_watch", note="订阅显示器状态失败：冻住后醒来锁着就当作离开过，不等显示器亮")
         if self.args.restart:
             self.restore(peer.path, signals=peer.authenticated_reports is None)
         self.restore_history(peer.path)
@@ -329,10 +375,10 @@ class Judge:
         since = self.peer.now() - self.args.ref_window - 60
         recent = []
         try:
-            with open(path, newline="", encoding="utf-8-sig") as f:
+            with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
                 rows = []
                 for r in csv.DictReader(f):
-                    if r["event"] in events:
+                    if r["event"] in events and log_time(r["time"]) is not None:
                         rows.append(r)
                     elif signals and r["event"] == "report":
                         try:
@@ -349,7 +395,7 @@ class Judge:
         away = prompt = None
         prompting, pid, brightness = False, None, None
         for r in rows:
-            ts = datetime.fromisoformat(r["time"]).timestamp()
+            ts = log_time(r["time"])
             ev = r["event"]
             if ev in ("lock", "would_lock"):
                 away, prompt, prompting = ts, None, False
@@ -401,23 +447,25 @@ class Judge:
         for file in [os.path.join(folder, f) for f in older[-1:]] + [path]:
             report_time = None
             try:
-                with open(file, newline="", encoding="utf-8-sig") as f:
+                # 守护进程和工作进程都往同一个日志里写，偶尔撞在一起，留下半个汉字，
+                # 读不出来的字节换掉、时间读不出来的行跳过，不然工作进程每次一启动就崩
+                with open(file, newline="", encoding="utf-8-sig", errors="replace") as f:
                     for r in csv.DictReader(f):
                         ev = r["event"]
                         if ev == "report":
-                            report_time = r["time"]
+                            report_time = log_time(r["time"]) or report_time
                         elif ev == "phone_known":
                             m = re.search(r"last=(\d+)", r["note"] or "")
                             if m:
                                 last_report = max(last_report or 0, int(m.group(1)))
                         elif ev == "lock_hold":
-                            hold = r["time"]
+                            hold = log_time(r["time"]) or hold
                         elif ev in ("lock_resume", "lock", "would_lock"):
                             hold = None
             except (OSError, csv.Error, KeyError):
                 continue
             if report_time:
-                last_report = max(last_report or 0, datetime.fromisoformat(report_time).timestamp())
+                last_report = max(last_report or 0, report_time)
         now = time.time()
         self.phone_known = (self.peer.unlock_backend is not None
                             or (last_report is not None and now - last_report <= 7 * 86400))
@@ -429,7 +477,7 @@ class Judge:
                                               + (f" last={int(last_report)}" if last_report else ""))
         if hold is not None:
             self.hold_lock = True
-            note = f"{now - datetime.fromisoformat(hold).timestamp():.0f}s 前手机还没回来就被解开了，接着不自动锁，等手机回来"
+            note = f"{now - hold:.0f}s 前手机还没回来就被解开了，接着不自动锁，等手机回来"
             self.peer.say(f"接上前一个进程：{note}")
             self.peer.log("lock_hold", note="接上前一个进程：" + note)
 
@@ -476,6 +524,8 @@ class Judge:
 
     def update(self):
         a, p, now = self.args, self.peer, time.time()
+        gap = now - self.last_update if self.last_update is not None else 0.0
+        self.last_update = now
         p.mark("idle_check")
         idle = input_idle_seconds()
         med = self.rssi_median()
@@ -517,6 +567,26 @@ class Judge:
         if locked and self.away_at is not None:
             self.seen_locked = True
 
+        # 电脑端被冻住过（合盖、我们关屏进的待机，电源请求都挡不住），醒来时锁着：冻住期间看不到手机走没走，
+        # 当作手机走远过（armed），手机在旁边就请提示。不然走开时合了盖、冻住前还没判定离开的话，
+        # 醒来后手机马上连回，电脑端却没看到手机走过，一直不提示，只能手动解锁。
+        # 要等显示器亮了（按电源键、开盖、动鼠标）才算：每小时一次的维护唤醒显示器不亮、盖子可能合着，这时不能解
+        if gap >= a.freeze_away and a.lock and locked and not (self.armed or self.prompting):
+            if self.frozen_since is None and self.display.on is False:
+                p.log("freeze_wait", note=f"电脑端 {gap:.0f}s 没转（待机冻住了），醒来锁着、显示器没亮，等亮了再当作离开过")
+            self.frozen_since = self.frozen_since or now - gap
+        if self.frozen_since is not None:
+            if not locked or self.armed or self.prompting:
+                self.frozen_since = None
+            elif self.display.on is not False:
+                note = (f"电脑端从 {datetime.fromtimestamp(self.frozen_since):%H:%M:%S} 起被待机冻住，"
+                        "醒来锁着、显示器亮了，当作手机走远过，手机在旁边就请提示")
+                p.say(note)
+                p.log("freeze_away", note=note)
+                self.armed = True
+                self.ref_start = self.frozen_since  # 「走远时的信号」只看冻住以后的报告，冻住前人还坐着
+                self.frozen_since = None
+
         # 判定离开 → 锁屏；手机走后已经锁过一次、被解开了就不再锁（hold_lock）
         if state == "away" and self.away_at is None and self.hold_lock:
             if entering_away:
@@ -524,8 +594,10 @@ class Judge:
                 p.say("判定离开，但手机走后已经锁过一次、被解开了，不再锁")
                 p.log("lock_skip", note=why + "；手机走后已经锁过一次、被解开了，手机回来以前不再自动锁")
         elif state == "away" and self.away_at is None:
-            self.away_at, self.armed = now, True
-            self.ref_start = self.ref_start or self.gone_start(now)
+            # 判定离开只要手机失联或信号弱 10 秒，还不算「走远过」（armed）：要像下面那样持续走远 --cancel-after 秒。
+            # 这时就算走远过的话，判定离开后头二十来秒「走远时的信号」还没有报告（reference 为 None），「强 10 dB」被跳过，
+            # 信号回到 -72 就请提示：手机在屋里、信号只是跌了一下，电脑也会自动解锁，其实没人用
+            self.away_at = now
             why = f"空闲 {idle:.0f}s，" + ("手机失联" if lost else f"信号 {med:.0f}")
             if not a.lock:
                 p.say("⇒ 本来会锁屏")
@@ -735,6 +807,14 @@ class Judge:
         elif self.screen_locked():
             text += "，锁屏中"
         return text
+
+
+def log_time(text):
+    """日志 time 列转成时间戳；行被写坏了（读不出来）返回 None"""
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def open_log(path):
@@ -1940,7 +2020,9 @@ if __name__ == "__main__":
     g.add_argument("--dormant-after", type=float, default=1800,
                    help="锁着并且多少秒没碰键盘鼠标就休眠（不看信号），默认 1800（30 分钟）")
     g.add_argument("--dormant-interval", type=float, default=30, help="休眠时心跳间隔，默认 30 秒")
-    g.add_argument("--startup-grace", type=float, default=30, help="电脑端启动后多少秒内不算手机失联，默认 30")
+    g.add_argument("--freeze-away", type=float, default=60,
+                   help="电脑端被待机冻住多少秒、醒来时锁着（显示器亮了），就当作手机走远过、回来请提示，默认 60")
+    g.add_argument("--startup-grace",type=float, default=30, help="电脑端启动后多少秒内不算手机失联，默认 30")
     p.add_argument("--adv-repair-after", type=float, default=1800,
                    help="协议广播坏了（ABORTED）多少秒、并且人不在电脑前，就停掉工作进程、关开一次蓝牙修，默认 1800；0 表示不修")
     p.add_argument("--adv-repair-gap", type=float, default=10800, help="两次修之间至少隔多少秒，默认 10800（3 小时）")
