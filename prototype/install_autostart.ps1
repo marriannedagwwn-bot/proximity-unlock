@@ -41,7 +41,7 @@ if ($Uninstall) {
 }
 
 $pythonw = Join-Path $root ".venv\Scripts\pythonw.exe"
-if (-not (Test-Path $pythonw)) { throw "找不到 $pythonw，先在项目里建好 .venv 并 pip install bleak" }
+if (-not (Test-Path $pythonw)) { throw "找不到 $pythonw，先在项目里建好 .venv 并装好依赖：py -3.12 -m venv .venv，.venv\Scripts\python -m pip install -r requirements-windows.txt" }
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument "prototype\win_peer.py --log-dir logs" -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user

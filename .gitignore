@@ -26,3 +26,6 @@ mac_peer_stdout.txt
 
 # 开机自启的日志
 logs/
+
+# Windows 安装包（prototype/package_windows.ps1 的输出）
+dist/

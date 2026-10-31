@@ -1,0 +1,11 @@
+# Windows 电脑端（prototype/win_peer.py、bt_toggle.py）用的 WinRT 包，Python 3.12 x64。
+# 装法：py -3.12 -m venv .venv，然后 .venv\Scripts\python -m pip install -r requirements-windows.txt
+winrt-runtime==3.2.1
+winrt-Windows.Devices.Bluetooth==3.2.1
+winrt-Windows.Devices.Bluetooth.Advertisement==3.2.1
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile==3.2.1
+winrt-Windows.Devices.Enumeration==3.2.1
+winrt-Windows.Devices.Radios==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Storage.Streams==3.2.1

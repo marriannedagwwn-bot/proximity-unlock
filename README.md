@@ -30,13 +30,13 @@
 |---|---|---|
 | iPhone | `ProximityUnlock-<版本>-unsigned.ipa` | **没有签名**，用你自己的 Apple ID 或证书签了再装（AltStore、Sideloadly、Xcode 等）。需要 iOS 17 以上，要给蓝牙、通知、相机（扫码）权限。 |
 | macOS | `MacPeer-<版本>-macOS.zip` | Apple 芯片和 Intel 通用，需要 macOS 13 以上。**没有经过 Apple 公证**，第一次打开时系统会拦，去「系统设置 → 隐私与安全性」里点「仍要打开」。要给蓝牙、辅助功能权限。用法见 [`prototype/mac_peer/README.md`](prototype/mac_peer/README.md)。 |
-| Windows | 稍后提供 | 现在可以从源码运行，见下面。 |
+| Windows | `ProximityUnlock-<版本>-Windows-x64.zip` | Windows 10/11 x64，要自己装 Python 3.12。里面是电脑端脚本和编译好的自动解锁组件（Credential Provider），**exe 和 DLL 没有代码签名**。自动解锁只支持本机管理员账户、本地控制台；有密码账户还没在真机上验证过，先自己试。装法见 [`INSTALL-Windows.md`](INSTALL-Windows.md)。 |
 
 ## 从源码编译和运行
 
 - **iPhone App**：[`ios/README.md`](ios/README.md)（Xcode 16 以上）。
 - **Mac 电脑端**：[`prototype/mac_peer/README.md`](prototype/mac_peer/README.md)（SwiftPM，`build.sh` 打包成 `MacPeer.app`，`autostart.sh install` 装成登录自启）。
-- **Windows 电脑端**：`prototype/win_peer.py`（Python 3.12，WinRT 蓝牙），`prototype/install_autostart.ps1` 装成登录自启；自动解锁用的 Credential Provider 和支持范围见 [`prototype/windows_unlock/README.md`](prototype/windows_unlock/README.md)。
+- **Windows 电脑端**：`prototype/win_peer.py`（Python 3.12，WinRT 蓝牙，依赖见 `requirements-windows.txt`），`prototype/install_autostart.ps1` 装成登录自启，`prototype/package_windows.ps1` 打安装包；自动解锁用的 Credential Provider 和支持范围见 [`prototype/windows_unlock/README.md`](prototype/windows_unlock/README.md)。
 - **蓝牙信号实测工具**：[`docs/rssi_probe.md`](docs/rssi_probe.md)。
 
 ## 安全须知
